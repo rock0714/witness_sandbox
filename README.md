@@ -4,7 +4,7 @@
 
 ![パース補正の様子](assets/perspective.png)
 
-<video src="assets/usecase.mp4" controls="controls" width="100%" muted="muted"></video>
+![動画での利用例](assets/usecase.mp4)
 
 ---
 
