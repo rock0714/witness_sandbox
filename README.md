@@ -2,6 +2,10 @@
 
 「The Witness」のゲーム画面をキャプチャし、斜めに傾いたパズル盤面をOpenCVの透視投影変換（Perspective Warp）で真正面の真四角画像に補正した上で、仮想グリッド上で一筆書きやブロック塗りつぶしによる考察を行えるサポートツールです。
 
+![パース補正の様子](assets/perspective.png)
+
+<video src="assets/usecase.mp4" controls="controls" width="100%" muted="muted"></video>
+
 ---
 
 ## 🌟 主な機能

@@ -1609,12 +1609,17 @@ class MainWindow(QMainWindow):
         btn_detect_sb.clicked.connect(self.action_detect_grid)
         layout.addWidget(btn_detect_sb)
 
+        self.chk_unlock_size = QCheckBox("制限解除")
+        self.chk_unlock_size.setToolTip("チェックを入れると9以上のサイズや1〜2のサイズが選択可能になります")
+        self.chk_unlock_size.stateChanged.connect(self._on_unlock_size_changed)
+        layout.addWidget(self.chk_unlock_size)
+
         layout.addWidget(QLabel("列:"))
         self.slider_cols = QSlider(Qt.Orientation.Horizontal)
-        self.slider_cols.setRange(1, 20)
+        self.slider_cols.setRange(3, 8)
         self.slider_cols.setValue(4)
         self.slider_cols.setFixedWidth(70)
-        self.slider_cols.setToolTip("盤面の列数を変更します (1〜20)")
+        self.slider_cols.setToolTip("盤面の列数を変更します (3〜8)")
         self.lbl_cols_val = QLabel("4")
         self.lbl_cols_val.setFixedWidth(16)
         self.slider_cols.valueChanged.connect(self._on_cols_slider_changed)
@@ -1623,10 +1628,10 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(QLabel("行:"))
         self.slider_rows = QSlider(Qt.Orientation.Horizontal)
-        self.slider_rows.setRange(1, 20)
+        self.slider_rows.setRange(3, 8)
         self.slider_rows.setValue(4)
         self.slider_rows.setFixedWidth(70)
-        self.slider_rows.setToolTip("盤面の行数を変更します (1〜20)")
+        self.slider_rows.setToolTip("盤面の行数を変更します (3〜8)")
         self.lbl_rows_val = QLabel("4")
         self.lbl_rows_val.setFixedWidth(16)
         self.slider_rows.valueChanged.connect(self._on_rows_slider_changed)
@@ -1846,6 +1851,8 @@ class MainWindow(QMainWindow):
             return
 
         cols, rows, margin = detect_grid_dimensions(img_to_analyze, pts)
+        if cols > 8 or rows > 8 or cols < 3 or rows < 3:
+            self.chk_unlock_size.setChecked(True)
         self.slider_cols.blockSignals(True)
         self.slider_rows.blockSignals(True)
         self.slider_cols.setValue(cols)
@@ -1880,6 +1887,8 @@ class MainWindow(QMainWindow):
         try:
             # 補正前に自動でグリッド線（マス目数）を自動検知
             detected_cols, detected_rows, detected_margin = detect_grid_dimensions(self.captured_bgr, pts)
+            if detected_cols > 8 or detected_rows > 8 or detected_cols < 3 or detected_rows < 3:
+                self.chk_unlock_size.setChecked(True)
             self.slider_cols.blockSignals(True)
             self.slider_rows.blockSignals(True)
             self.slider_cols.setValue(detected_cols)
@@ -1928,6 +1937,19 @@ class MainWindow(QMainWindow):
     def spin_rows(self):
         """後方互換用エイリアス"""
         return self.slider_rows
+
+    def _on_unlock_size_changed(self, state: int):
+        """制限解除チェックボックスの変更ハンドラ"""
+        if state == Qt.CheckState.Checked.value:
+            self.slider_cols.setRange(1, 20)
+            self.slider_rows.setRange(1, 20)
+            self.slider_cols.setToolTip("盤面の列数を変更します (1〜20)")
+            self.slider_rows.setToolTip("盤面の行数を変更します (1〜20)")
+        else:
+            self.slider_cols.setRange(3, 8)
+            self.slider_rows.setRange(3, 8)
+            self.slider_cols.setToolTip("盤面の列数を変更します (3〜8)")
+            self.slider_rows.setToolTip("盤面の行数を変更します (3〜8)")
 
     def _on_cols_slider_changed(self, val: int):
         """列スライダー変更ハンドラ"""
