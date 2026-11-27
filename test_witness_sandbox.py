@@ -312,7 +312,10 @@ class TestSandboxCanvas(unittest.TestCase):
         self.canvas.cell_fills[cell] = QColor(0, 200, 255)
         self.canvas.freehand_strokes.append(
             {
-                "points": [QPointF(100, 100), QPointF(120, 120)],
+                "points": [
+                    self.canvas.widget_to_image_coords(QPointF(100, 100)),
+                    self.canvas.widget_to_image_coords(QPointF(120, 120)),
+                ],
                 "color": QColor(255, 255, 255),
                 "width": 4,
             }
@@ -336,6 +339,81 @@ class TestSandboxCanvas(unittest.TestCase):
         self.assertNotIn(
             cell, self.canvas.cell_fills, "消しゴムでセル塗りが消去されていません"
         )
+
+    def test_freehand_stroke_stays_aligned_on_resize(self):
+        """ウィンドウを縦長・横長にリサイズしても自由手書きが盤面位置からずれず消去も可能なこと。"""
+        self.canvas.set_draw_mode(DrawMode.FREEHAND)
+
+        # 600x600 表示時にグリッド頂点 (1, 1) -> (3, 2) を結ぶストロークをマウス描画
+        p_start_init = QPointF(self.canvas.vertex_to_widget_coords(1, 1).toPoint())
+        p_end_init = QPointF(self.canvas.vertex_to_widget_coords(3, 2).toPoint())
+        expected_img_start = self.canvas.widget_to_image_coords(p_start_init)
+        expected_img_end = self.canvas.widget_to_image_coords(p_end_init)
+
+        QTest.mousePress(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            p_start_init.toPoint(),
+        )
+        for i in range(1, 11):
+            t = i / 10.0
+            pt = QPointF(
+                p_start_init.x() + (p_end_init.x() - p_start_init.x()) * t,
+                p_start_init.y() + (p_end_init.y() - p_start_init.y()) * t,
+            )
+            QTest.mouseMove(self.canvas, pt.toPoint())
+        QTest.mouseRelease(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            p_end_init.toPoint(),
+        )
+
+        self.assertEqual(len(self.canvas.freehand_strokes), 1, "自由手書きが記録されていません")
+        stroke = self.canvas.freehand_strokes[0]
+        self.assertEqual(stroke["width"], 4, "手書きの線幅は4固定であるべきです")
+        self.assertAlmostEqual(stroke["points"][0].x(), expected_img_start.x(), places=4)
+        self.assertAlmostEqual(stroke["points"][0].y(), expected_img_start.y(), places=4)
+        self.assertAlmostEqual(stroke["points"][-1].x(), expected_img_end.x(), places=4)
+        self.assertAlmostEqual(stroke["points"][-1].y(), expected_img_end.y(), places=4)
+
+        # 横長 (左右余白発生) および縦長 (上下余白発生) へリサイズしても盤面頂点と一致し続ける
+        for new_w, new_h in [(1000, 500), (480, 900)]:
+            self.canvas.resize(new_w, new_h)
+            # 実際のレンダリング処理 (paintEvent) が例外なく完了することも確認
+            rendered = self.canvas.grab()
+            self.assertFalse(rendered.isNull())
+
+            v_start_now = self.canvas.vertex_to_widget_coords(1, 1)
+            v_end_now = self.canvas.vertex_to_widget_coords(3, 2)
+            s_start_now = self.canvas.image_to_widget_coords(stroke["points"][0])
+            s_end_now = self.canvas.image_to_widget_coords(stroke["points"][-1])
+
+            # 初期クリック時の整数ピクセル丸め (最大 1px * 倍率比) の範囲内で盤面頂点に追従していること
+            self.assertLessEqual(
+                np.hypot(s_start_now.x() - v_start_now.x(), s_start_now.y() - v_start_now.y()),
+                2.0,
+                f"リサイズ ({new_w}x{new_h}) 後に手書き始点が盤面からずれています",
+            )
+            self.assertLessEqual(
+                np.hypot(s_end_now.x() - v_end_now.x(), s_end_now.y() - v_end_now.y()),
+                2.0,
+                f"リサイズ ({new_w}x{new_h}) 後に手書き終点が盤面からずれています",
+            )
+
+        # リサイズ後 (480x900) の表示位置の中点で消しゴム当たり判定・消去が機能すること
+        s_start_now = self.canvas.image_to_widget_coords(stroke["points"][0])
+        s_end_now = self.canvas.image_to_widget_coords(stroke["points"][-1])
+        mid_resized = QPointF(
+            (s_start_now.x() + s_end_now.x()) / 2.0,
+            (s_start_now.y() + s_end_now.y()) / 2.0,
+        )
+        self.assertTrue(
+            self.canvas.erase_at_pos(mid_resized),
+            "リサイズ後の表示座標で自由手書きを消しゴム消去できません",
+        )
+        self.assertEqual(len(self.canvas.freehand_strokes), 0)
 
     def test_grid_adjust_corner_edge_and_move(self):
         """枠調整モードで角リサイズ・辺リサイズ・全体移動が機能し、線が塗られないこと。"""

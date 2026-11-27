@@ -606,9 +606,9 @@ class SandboxCanvas(QWidget):
         # 2. セル塗りつぶしデータ: {(col, row): QColor}
         self.cell_fills: dict[tuple[int, int], QColor] = {}
 
-        # 3. フリーハンドストローク: list[dict] ({"points": [QPointF], "color": QColor, "width": int})
+        # 3. フリーハンドストローク: list[dict] ({"points": [QPointF] (元画像座標系), "color": QColor, "width": int})
         self.freehand_strokes: list[dict] = []
-        self.active_stroke: list[QPointF] = []
+        self.active_stroke: list[QPointF] = []  # 元画像座標系での描画中ストローク点列
 
         # 4. 操作履歴 (Undo用)
         # 各要素: {"type": "path"|"fill"|"stroke", "data": ...}
@@ -765,8 +765,8 @@ class SandboxCanvas(QWidget):
             stroke = self.freehand_strokes[idx]
             pts = stroke.get("points", [])
             for i in range(len(pts) - 1):
-                p1 = pts[i]
-                p2 = pts[i + 1]
+                p1 = self.image_to_widget_coords(pts[i])
+                p2 = self.image_to_widget_coords(pts[i + 1])
                 dist = point_to_segment_distance(px, py, p1.x(), p1.y(), p2.x(), p2.y())
                 if dist <= threshold_px:
                     return idx
@@ -831,6 +831,18 @@ class SandboxCanvas(QWidget):
         offset_x = (self.width() - self.pixmap.width() * scale) / 2
         offset_y = (self.height() - self.pixmap.height() * scale) / 2
         return scale, offset_x, offset_y
+
+    def widget_to_image_coords(self, pt: QPointF) -> QPointF:
+        """ウィジェット上の表示座標を補正後画像の元座標に変換する。"""
+        scale, ox, oy = self.get_display_scale_and_offset()
+        if scale <= 0:
+            return QPointF(pt)
+        return QPointF((pt.x() - ox) / scale, (pt.y() - oy) / scale)
+
+    def image_to_widget_coords(self, pt: QPointF) -> QPointF:
+        """補正後画像の元座標をウィジェット上の表示座標に変換する。"""
+        scale, ox, oy = self.get_display_scale_and_offset()
+        return QPointF(pt.x() * scale + ox, pt.y() * scale + oy)
 
     def get_grid_bounds(self) -> tuple[float, float, float, float]:
         """
@@ -1067,7 +1079,7 @@ class SandboxCanvas(QWidget):
                 wpt = self.vertex_to_widget_coords(c, r)
                 painter.drawEllipse(wpt, dot_r, dot_r)
 
-        # 4. フリーハンドストロークの描画
+        # 4. フリーハンドストロークの描画 (頂点は元画像座標系から表示座標へ変換、線幅は表示ピクセル固定)
         all_strokes = list(self.freehand_strokes)
         if self.active_stroke:
             all_strokes.append({
@@ -1086,8 +1098,9 @@ class SandboxCanvas(QWidget):
                 Qt.PenCapStyle.RoundCap,
                 Qt.PenJoinStyle.RoundJoin
             ))
-            for i in range(len(pts) - 1):
-                painter.drawLine(pts[i], pts[i + 1])
+            w_pts = [self.image_to_widget_coords(p) for p in pts]
+            for i in range(len(w_pts) - 1):
+                painter.drawLine(w_pts[i], w_pts[i + 1])
 
         # 5. 塗られた辺の描画 (The Witness風の太いライン)
         line_w = self.line_width
@@ -1194,9 +1207,9 @@ class SandboxCanvas(QWidget):
                 self.update()
 
         elif self.draw_mode == DrawMode.FREEHAND:
-            # フリーハンド描画開始
+            # フリーハンド描画開始 (元画像座標系で記録)
             if event.button() == Qt.MouseButton.LeftButton:
-                self.active_stroke = [pos]
+                self.active_stroke = [self.widget_to_image_coords(pos)]
                 self.update()
 
         elif self.draw_mode == DrawMode.ERASER:
@@ -1332,7 +1345,7 @@ class SandboxCanvas(QWidget):
 
         elif self.draw_mode == DrawMode.FREEHAND:
             if self.active_stroke:
-                self.active_stroke.append(pos)
+                self.active_stroke.append(self.widget_to_image_coords(pos))
                 self.update()
 
         elif self.draw_mode == DrawMode.CELL_FILL:
