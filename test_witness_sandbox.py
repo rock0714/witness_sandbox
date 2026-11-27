@@ -6,12 +6,14 @@ witness_sandbox.py の自動テストスイート。
 
 import os
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
 # PyQt6 のインポート前にオフスクリーンモードを設定
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
+import cv2
 import numpy as np
 from PIL import Image
 from PyQt6.QtCore import QPointF, Qt
@@ -28,8 +30,11 @@ from witness_sandbox import (
     create_sample_witness_image,
     cv_to_qpixmap,
     detect_grid_dimensions,
+    load_image_bgr,
+    normalize_save_image_path,
     order_points,
     point_to_segment_distance,
+    validate_quad_points,
     warp_perspective,
 )
 
@@ -138,6 +143,64 @@ class TestGeometryAndVision(unittest.TestCase):
 
         d2 = point_to_segment_distance(12.0, 0.0, 0.0, 0.0, 10.0, 0.0)
         self.assertAlmostEqual(d2, 2.0, places=5, msg=f"端点外の距離が不正: {d2}")
+
+    def test_order_points_rotated_diamond_and_degenerate_validation(self):
+        """大きく回転したひし形でも4点が重複なく整列され、重複・一直線・非凸4点は拒否されること。"""
+        # 旧アルゴリズム (x+y / x-y 極値) では重複選択が起きていたひし形座標
+        diamond_shuffled = np.array(
+            [
+                [300, 500],  # 下
+                [120, 320],  # 左
+                [300, 100],  # 上
+                [500, 280],  # 右
+            ],
+            dtype="float32",
+        )
+        ordered = validate_quad_points(diamond_shuffled)
+        # 4頂点すべてが一意に保持され、時計回り [上, 右, 下, 左] になること
+        np.testing.assert_allclose(ordered[0], [300, 100])
+        np.testing.assert_allclose(ordered[1], [500, 280])
+        np.testing.assert_allclose(ordered[2], [300, 500])
+        np.testing.assert_allclose(ordered[3], [120, 320])
+
+        warped = warp_perspective(self.sample_img, diamond_shuffled, aspect_mode="square")
+        self.assertEqual(warped.shape[0], warped.shape[1])
+
+        # 1. 重複点を含む4点 -> ValueError
+        duplicate_pts = np.array(
+            [[100, 100], [100, 100], [400, 100], [400, 400]], dtype="float32"
+        )
+        with self.assertRaises(ValueError):
+            validate_quad_points(duplicate_pts)
+        with self.assertRaises(ValueError):
+            warp_perspective(self.sample_img, duplicate_pts)
+
+        # 2. 一直線 (共線) 上の4点 -> ValueError
+        collinear_pts = np.array(
+            [[100, 100], [200, 200], [300, 300], [400, 400]], dtype="float32"
+        )
+        with self.assertRaises(ValueError):
+            validate_quad_points(collinear_pts)
+
+        # 3. 凹四角形 (1点が他3点の三角形内部にあるブーメラン型) -> ValueError
+        concave_pts = np.array(
+            [[100, 100], [500, 100], [250, 220], [100, 500]], dtype="float32"
+        )
+        with self.assertRaises(ValueError):
+            validate_quad_points(concave_pts)
+
+        # 4. 極小面積 (各辺 >= 5px だが面積 36 < 100) および NaN 入力 -> ValueError
+        tiny_pts = np.array(
+            [[100, 100], [106, 100], [106, 106], [100, 106]], dtype="float32"
+        )
+        with self.assertRaises(ValueError):
+            validate_quad_points(tiny_pts)
+
+        nan_pts = np.array(
+            [[100, 100], [float("nan"), 100], [200, 200], [100, 200]], dtype="float32"
+        )
+        with self.assertRaises(ValueError):
+            order_points(nan_pts)
 
 
 # ==============================================================================
@@ -1147,6 +1210,159 @@ class TestMainWindowAndCapture(unittest.TestCase):
             canvas.edges,
             "全消去ボタンクリック後に Undo で辺が復元されていません",
         )
+
+    def test_action_capture_screen_non_windows_fallback(self):
+        """ctypes.windll が存在しない非 Windows 環境でもエラーダイアログを出さず全画面フォールバックすること。"""
+        self.window.show()
+        fake_full_shot = Image.new("RGB", (640, 360), (40, 80, 120))
+
+        with (
+            mock.patch.object(main_mod, "ctypes", new=mock.MagicMock(spec=[])),
+            mock.patch.object(main_mod.ImageGrab, "grab", return_value=fake_full_shot) as mock_grab,
+            mock.patch.object(main_mod.QMessageBox, "critical") as mock_crit,
+        ):
+            self.window.action_capture_screen()
+
+        mock_crit.assert_not_called()
+        mock_grab.assert_called_once()
+        self.assertEqual(self.window.captured_bgr.shape, (360, 640, 3))
+
+    def test_load_image_bgr_validation_and_action_open_file_error_handling(self):
+        """日本語パス読込、空/破損/ファイルサイズ超過/解像度超過 (Image Bomb) の検証と例外保護。"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # 1. 日本語ファイル名の正常画像読込
+            jp_path = os.path.join(tmpdir, "サンプル盤面_テスト.png")
+            Image.new("RGB", (120, 90), (10, 100, 200)).save(jp_path, format="PNG")
+            loaded_bgr = load_image_bgr(jp_path)
+            self.assertEqual(loaded_bgr.shape, (90, 120, 3))
+
+            # 2. 存在しないファイル -> OSError
+            with self.assertRaises(OSError):
+                load_image_bgr(os.path.join(tmpdir, "not_found.png"))
+
+            # 3. 空ファイル (0 byte) -> ValueError
+            empty_path = os.path.join(tmpdir, "empty.png")
+            with open(empty_path, "wb"):
+                pass
+            with self.assertRaises(ValueError):
+                load_image_bgr(empty_path)
+
+            # 4. 壊れた画像バイト列 -> ValueError (with クローズにより即座に削除可能であることも確認)
+            corrupt_path = os.path.join(tmpdir, "corrupt.png")
+            with open(corrupt_path, "wb") as f:
+                f.write(b"not-an-image-payload")
+            with self.assertRaises(ValueError):
+                load_image_bgr(corrupt_path)
+            os.remove(corrupt_path)
+
+            # 5. ファイルサイズ上限超過 -> ValueError
+            with self.assertRaises(ValueError):
+                load_image_bgr(jp_path, max_file_bytes=10)
+
+            # 6. 展開前解像度上限超過 (Image Bomb 対策: cv2.imdecode が呼ばれる前に拒否)
+            with mock.patch.object(main_mod.cv2, "imdecode") as mock_imdecode:
+                with self.assertRaises(ValueError):
+                    load_image_bgr(jp_path, max_side_px=50)
+                with self.assertRaises(ValueError):
+                    load_image_bgr(jp_path, max_pixels=1000)
+                mock_imdecode.assert_not_called()
+
+            # 7. MainWindow.action_open_file での例外捕捉と警告ダイアログ表示
+            with (
+                mock.patch.object(
+                    main_mod.QFileDialog,
+                    "getOpenFileName",
+                    return_value=(empty_path, "画像ファイル (*.png)"),
+                ),
+                mock.patch.object(main_mod.QMessageBox, "warning") as mock_warn,
+            ):
+                self.window.action_open_file()
+            mock_warn.assert_called_once()
+
+    def test_export_image_native_resolution_without_overlays_and_save_extension(self):
+        """保存画像が元解像度・黒帯なし・一時UI（枠調整ハンドル/ホバー）なしで出力され拡張子も補完されること。"""
+        self.window.action_execute_warp()
+        canvas = self.window.sandbox_canvas
+        native_w = canvas.pixmap.width()
+        native_h = canvas.pixmap.height()
+
+        # あえて小さい横長サイズにして左右に大きな黒帯余白 (25, 25, 28) を発生させる
+        canvas.resize(500, 260)
+        canvas.show()
+
+        # 辺塗りとセル塗りを1つずつ入れ、さらに枠調整モード (オレンジ枠+ハンドル表示) & ホバー状態にする
+        canvas.apply_edge(((0, 0), (1, 0)), "paint")
+        canvas.cell_fills[(1, 1)] = QColor(0, 208, 255)
+        canvas.set_draw_mode(DrawMode.GRID_ADJUST)
+        canvas.hovered_edge = ((2, 0), (3, 0))
+
+        exported = canvas.render_export_image()
+        self.assertFalse(exported.isNull())
+        self.assertEqual(
+            (exported.width(), exported.height()),
+            (native_w, native_h),
+            "ウィジェットサイズではなく補正後画像の元解像度で出力されるべきです",
+        )
+
+        # 左上端ピクセルがウィジェット余白の黒帯色 (25, 25, 28) ではなく盤面色であること
+        corner_col = exported.pixelColor(2, 2)
+        self.assertNotEqual(
+            (corner_col.red(), corner_col.green(), corner_col.blue()),
+            (25, 25, 28),
+            "ウィジェット余白の黒帯が混入しています",
+        )
+
+        # 右下ハンドル位置に枠調整用のオレンジ塗り (255, 170, 0) が焼き込まれていないこと
+        br_img_pt = canvas.vertex_to_image_coords(canvas.cols, canvas.rows)
+        br_col = exported.pixelColor(int(br_img_pt.x()), int(br_img_pt.y()))
+        self.assertNotEqual(
+            (br_col.red(), br_col.green(), br_col.blue()),
+            (255, 170, 0),
+            "枠調整ハンドルが保存画像に写り込んでいます",
+        )
+
+        # SNAP_LINE モードでホバー中の辺があっても、ホバーなし時と保存画像が完全一致すること
+        canvas.set_draw_mode(DrawMode.SNAP_LINE)
+        canvas.hovered_edge = None
+        exported_no_hover = canvas.render_export_image()
+        canvas.hovered_edge = ((1, 0), (2, 0))
+        exported_with_hover = canvas.render_export_image()
+        p10 = canvas.vertex_to_image_coords(1, 0)
+        p20 = canvas.vertex_to_image_coords(2, 0)
+        mid_x, mid_y = int((p10.x() + p20.x()) / 2.0), int(p10.y())
+        self.assertEqual(
+            exported_with_hover.pixelColor(mid_x, mid_y),
+            exported_no_hover.pixelColor(mid_x, mid_y),
+            "ホバーハイライトが保存画像に写り込んでいます",
+        )
+
+        # 拡張子補完と実ファイル保存の検証 (日本語ディレクトリ・拡張子省略時)
+        self.assertEqual(
+            normalize_save_image_path("result_img", "PNG画像 (*.png)"),
+            "result_img.png",
+        )
+        self.assertEqual(
+            normalize_save_image_path("result_img", "JPEG画像 (*.jpg *.jpeg)"),
+            "result_img.jpg",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw_save_base = os.path.join(tmpdir, "考察結果_出力")
+            with (
+                mock.patch.object(
+                    main_mod.QFileDialog,
+                    "getSaveFileName",
+                    return_value=(raw_save_base, "PNG画像 (*.png)"),
+                ),
+                mock.patch.object(main_mod.QMessageBox, "information") as mock_info,
+            ):
+                self.window.action_save_sandbox_image()
+
+            expected_saved = raw_save_base + ".png"
+            self.assertTrue(os.path.isfile(expected_saved), "拡張子補完されたPNGが保存されていません")
+            mock_info.assert_called_once()
+            saved_img = load_image_bgr(expected_saved)
+            self.assertEqual(saved_img.shape, (native_h, native_w, 3))
 
 
 if __name__ == "__main__":

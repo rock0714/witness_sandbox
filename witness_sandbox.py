@@ -11,9 +11,12 @@ The Witness サンドボックス支援ツール (Witness Sandbox Tool)
 7. 最前面表示 (TopMost) トグル
 """
 
+import io
+import os
 import sys
 import time
 import math
+import warnings
 import numpy as np
 import cv2
 from PIL import Image, ImageGrab
@@ -31,13 +34,21 @@ from PyQt6.QtWidgets import (
 )
 
 import ctypes
-from ctypes import wintypes
+try:
+    from ctypes import wintypes
+except ImportError:
+    wintypes = None  # type: ignore[assignment]
 
 # Windows API 定数
 MOD_NONE = 0x0000
 VK_F4 = 0x73
 WM_HOTKEY = 0x0312
 HOTKEY_ID_F4 = 1001
+
+# ローカル画像読込の上限設定 (OOM / Image Bomb 対策)
+MAX_IMAGE_FILE_BYTES = 50 * 1024 * 1024  # ファイルサイズ上限: 50 MB
+MAX_IMAGE_SIDE_PX = 10_000               # 1辺の最大ピクセル数: 10,000 px
+MAX_IMAGE_PIXELS = 50_000_000            # 最大総画素数: 5,000万画素 (8K超まで許容)
 
 
 # ==============================================================================
@@ -46,22 +57,123 @@ HOTKEY_ID_F4 = 1001
 
 def order_points(pts: np.ndarray) -> np.ndarray:
     """
-    4つの頂点座標を [左上, 右上, 右下, 左下] の順に幾何学的にソートする。
+    4つの頂点座標を重心からの偏角に基づき時計回りに並べ、
+    [左上, 右上, 右下, 左下] の順に幾何学的に整列する。
     pts: shape (4, 2)
     """
-    rect = np.zeros((4, 2), dtype="float32")
+    arr = np.asarray(pts, dtype="float32")
+    if arr.shape != (4, 2) or not np.isfinite(arr).all():
+        raise ValueError(f"4点の有効な (x, y) 座標が必要です: shape={arr.shape}")
 
-    # x + y の合計値: 左上(最小), 右下(最大)
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
+    center = arr.mean(axis=0)
+    angles = np.arctan2(arr[:, 1] - center[1], arr[:, 0] - center[0])
+    # 画面座標系 (x右正, y下正) では偏角の昇順が時計回り周順になる
+    cw_pts = arr[np.argsort(angles)]
 
-    # x - y の差分: 右上(最大), 左下(最小)
-    diff = pts[:, 0] - pts[:, 1]
-    rect[1] = pts[np.argmax(diff)]
-    rect[3] = pts[np.argmin(diff)]
+    # x + y が最小の頂点（同値時は y が小さい上側頂点）を左上 [0] に合わせる
+    sums = cw_pts[:, 0] + cw_pts[:, 1]
+    min_sum = np.min(sums)
+    candidates = np.where(np.isclose(sums, min_sum, atol=1e-4))[0]
+    if len(candidates) > 1:
+        tl_idx = int(candidates[np.argmin(cw_pts[candidates, 1])])
+    else:
+        tl_idx = int(candidates[0])
+
+    return np.roll(cw_pts, -tl_idx, axis=0).astype("float32")
+
+
+def validate_quad_points(
+    pts: np.ndarray, min_edge_len: float = 5.0, min_area: float = 100.0
+) -> np.ndarray:
+    """
+    4点が重複・共線・非凸・極小面積でない有効な凸四角形かを検証し、
+    整列済みの [左上, 右上, 右下, 左下] 座標配列を返す。不正時は ValueError を送出する。
+    """
+    arr = np.asarray(pts, dtype="float32")
+    if arr.shape != (4, 2) or not np.isfinite(arr).all():
+        raise ValueError("4点の有効な座標が指定されていません。")
+
+    # 任意の2点間の距離チェック（重複点・極端な近接点の検出）
+    for i in range(4):
+        for j in range(i + 1, 4):
+            if float(np.hypot(arr[i, 0] - arr[j, 0], arr[i, 1] - arr[j, 1])) < min_edge_len:
+                raise ValueError("指定された4点に重複または近すぎる点が含まれています。")
+
+    rect = order_points(arr)
+
+    # 時計回り順での連続辺ベクトルの外積による凸性・共線チェック
+    edges = [rect[(i + 1) % 4] - rect[i] for i in range(4)]
+    for i in range(4):
+        e1 = edges[i]
+        e2 = edges[(i + 1) % 4]
+        cross = float(e1[0] * e2[1] - e1[1] * e2[0])
+        if cross <= 1e-3:
+            raise ValueError("指定された4点が一直線上にあるか、凸四角形を形成していません。")
+
+    # Shoelace 公式による面積チェック
+    x = rect[:, 0]
+    y = rect[:, 1]
+    area = 0.5 * float(abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
+    if area < min_area:
+        raise ValueError("指定された4点の領域が小さすぎます。")
 
     return rect
+
+
+def load_image_bgr(
+    filepath: str,
+    max_file_bytes: int = MAX_IMAGE_FILE_BYTES,
+    max_side_px: int = MAX_IMAGE_SIDE_PX,
+    max_pixels: int = MAX_IMAGE_PIXELS,
+) -> np.ndarray:
+    """
+    日本語パス・ファイルサイズ上限・展開前解像度上限（Image Bomb 対策）を検証して
+    ローカル画像を BGR 配列として安全に読み込む。
+    ファイルアクセス失敗時は OSError、検証・デコード失敗時は ValueError を送出する。
+    """
+    file_size = os.path.getsize(filepath)
+    if file_size <= 0:
+        raise ValueError("画像ファイルが空です。")
+    if file_size > max_file_bytes:
+        limit_mb = max_file_bytes / (1024 * 1024)
+        raise ValueError(f"ファイルサイズが上限 ({limit_mb:.0f} MB) を超えています。")
+
+    with open(filepath, "rb") as stream:
+        raw_bytes = stream.read()
+
+    # ピクセル展開前にヘッダから画像寸法を検査して Image Bomb を防止
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(raw_bytes)) as pil_img:
+                w, h = pil_img.size
+    except (Image.DecompressionBombError, Image.DecompressionBombWarning) as e:
+        raise ValueError("画像解像度が安全上限を超えています。") from e
+    except Exception as e:
+        raise ValueError("有効な画像データとして認識できませんでした。") from e
+
+    if w <= 0 or h <= 0:
+        raise ValueError("画像の寸法が不正です。")
+    if w > max_side_px or h > max_side_px or (w * h) > max_pixels:
+        raise ValueError(
+            f"画像解像度 ({w}×{h}) が上限 (1辺最大 {max_side_px}px / 最大 {max_pixels:,} 画素) を超えています。"
+        )
+
+    numpy_array = np.frombuffer(raw_bytes, dtype=np.uint8)
+    img_bgr = cv2.imdecode(numpy_array, cv2.IMREAD_COLOR)
+    if img_bgr is None or img_bgr.size == 0:
+        raise ValueError("画像のデコードに失敗しました。")
+    return img_bgr
+
+
+def normalize_save_image_path(filepath: str, selected_filter: str = "") -> str:
+    """保存ファイルパスに有効な画像拡張子がない場合、選択フィルタに応じて拡張子を補完する。"""
+    _, ext = os.path.splitext(filepath)
+    if ext.lower() in (".png", ".jpg", ".jpeg"):
+        return filepath
+    if "jpg" in selected_filter.lower() or "jpeg" in selected_filter.lower():
+        return filepath + ".jpg"
+    return filepath + ".png"
 
 
 def point_to_segment_distance(px: float, py: float, x1: float, y1: float, x2: float, y2: float) -> float:
@@ -84,7 +196,10 @@ def detect_grid_dimensions(image_bgr: np.ndarray, pts: np.ndarray | None = None)
     戻り値: (cols, rows, margin_percent)
     """
     if pts is not None and len(pts) == 4:
-        rect = order_points(pts)
+        try:
+            rect = validate_quad_points(pts)
+        except ValueError:
+            return 4, 4, 0.05
         sample_size = 600
         dst = np.array([
             [0, 0],
@@ -215,7 +330,7 @@ def warp_perspective(
         - "grid": マス目が正方形 (1:1) になるよう、列数:行数の比率で補正
         - "original": 元の斜め画面上の推定ユークリッド距離比で補正
     """
-    rect = order_points(pts)
+    rect = validate_quad_points(pts)
     (tl, tr, br, bl) = rect
 
     # 基準となる幅と高さを計算
@@ -1125,24 +1240,28 @@ class SandboxCanvas(QWidget):
     # レンダリング
     # --------------------------------------------------------------------------
 
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.fillRect(self.rect(), QColor(25, 25, 28))
-
-        if self.pixmap.isNull():
-            painter.setPen(QColor(160, 160, 160))
-            painter.setFont(QFont("Arial", 14))
-            painter.drawText(
-                self.rect(),
-                Qt.AlignmentFlag.AlignCenter,
-                "補正後画像がありません。\nまずは四隅を指定して「補正してサンドボックスへ」を実行してください。"
-            )
-            return
-
-        scale, ox, oy = self.get_display_scale_and_offset()
-        dest_rect = QRectF(ox, oy, self.pixmap.width() * scale, self.pixmap.height() * scale)
+    def _render_scene(
+        self,
+        painter: QPainter,
+        scale: float,
+        ox: float,
+        oy: float,
+        include_active_stroke: bool = True,
+    ):
+        """
+        指定されたスケール・オフセットで盤面画像・セル塗り・仮想グリッド・
+        自由手書き・塗り辺を共通描画する（一時UIオーバーレイは含まない）。
+        """
+        dest_rect = QRectF(
+            ox, oy, self.pixmap.width() * scale, self.pixmap.height() * scale
+        )
         painter.drawPixmap(dest_rect.toRect(), self.pixmap)
+
+        def img_to_target(img_pt: QPointF) -> QPointF:
+            return QPointF(img_pt.x() * scale + ox, img_pt.y() * scale + oy)
+
+        def vertex_to_target(col: int, row: int) -> QPointF:
+            return img_to_target(self.vertex_to_image_coords(col, row))
 
         # 1. マス目の塗りつぶし描画 (半透明)
         min_x, min_y, max_x, max_y = self.get_grid_bounds()
@@ -1150,18 +1269,15 @@ class SandboxCanvas(QWidget):
         cell_h = (max_y - min_y) / self.rows
 
         for (c, r), col in self.cell_fills.items():
-            # ウィジェット座標でのセル矩形
             cx = (min_x + c * cell_w) * scale + ox
             cy = (min_y + r * cell_h) * scale + oy
             cw = cell_w * scale
             ch = cell_h * scale
             fill_rect = QRectF(cx, cy, cw, ch)
 
-            # 半透明カラーで塗る (アルファ値110で背景記号が透けて見えるように)
             alpha_color = QColor(col.red(), col.green(), col.blue(), 110)
             painter.fillRect(fill_rect, alpha_color)
 
-            # 境界のハイライト線
             painter.setPen(QPen(QColor(col.red(), col.green(), col.blue(), 180), 1.5))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(fill_rect)
@@ -1170,21 +1286,15 @@ class SandboxCanvas(QWidget):
         grid_pen = QPen(QColor(255, 255, 255, 80), 1.5, Qt.PenStyle.DashLine)
         outer_pen = QPen(QColor(255, 255, 255, 140), 2.5)
 
-        # 内枠線
         painter.setPen(grid_pen)
         for r in range(self.rows + 1):
-            p1 = self.vertex_to_widget_coords(0, r)
-            p2 = self.vertex_to_widget_coords(self.cols, r)
-            painter.drawLine(p1, p2)
+            painter.drawLine(vertex_to_target(0, r), vertex_to_target(self.cols, r))
         for c in range(self.cols + 1):
-            p1 = self.vertex_to_widget_coords(c, 0)
-            p2 = self.vertex_to_widget_coords(c, self.rows)
-            painter.drawLine(p1, p2)
+            painter.drawLine(vertex_to_target(c, 0), vertex_to_target(c, self.rows))
 
-        # 外枠
         painter.setPen(outer_pen)
-        tl = self.vertex_to_widget_coords(0, 0)
-        br = self.vertex_to_widget_coords(self.cols, self.rows)
+        tl = vertex_to_target(0, 0)
+        br = vertex_to_target(self.cols, self.rows)
         painter.drawRect(QRectF(tl, br))
 
         # 3. 格子頂点の小さなドット描画
@@ -1193,12 +1303,11 @@ class SandboxCanvas(QWidget):
         dot_r = 3.5
         for c in range(self.cols + 1):
             for r in range(self.rows + 1):
-                wpt = self.vertex_to_widget_coords(c, r)
-                painter.drawEllipse(wpt, dot_r, dot_r)
+                painter.drawEllipse(vertex_to_target(c, r), dot_r, dot_r)
 
-        # 4. フリーハンドストロークの描画 (頂点は元画像座標系から表示座標へ変換、線幅は表示ピクセル固定)
+        # 4. フリーハンドストロークの描画 (頂点は元画像座標系から対象座標へ変換、線幅は固定)
         all_strokes = list(self.freehand_strokes)
-        if self.active_stroke:
+        if include_active_stroke and self.active_stroke:
             all_strokes.append({
                 "points": self.active_stroke,
                 "color": self.current_color,
@@ -1215,27 +1324,66 @@ class SandboxCanvas(QWidget):
                 Qt.PenCapStyle.RoundCap,
                 Qt.PenJoinStyle.RoundJoin
             ))
-            w_pts = [self.image_to_widget_coords(p) for p in pts]
-            for i in range(len(w_pts) - 1):
-                painter.drawLine(w_pts[i], w_pts[i + 1])
+            t_pts = [img_to_target(p) for p in pts]
+            for i in range(len(t_pts) - 1):
+                painter.drawLine(t_pts[i], t_pts[i + 1])
 
         # 5. 塗られた辺の描画 (The Witness風の太いライン)
         line_w = self.line_width
         for key, color in self.edges.items():
-            a = self.vertex_to_widget_coords(*key[0])
-            b = self.vertex_to_widget_coords(*key[1])
+            a = vertex_to_target(*key[0])
+            b = vertex_to_target(*key[1])
             painter.setPen(QPen(
                 QColor(color.red(), color.green(), color.blue(), 70),
                 line_w + 8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin
             ))
             painter.drawLine(a, b)
         for key, color in self.edges.items():
-            a = self.vertex_to_widget_coords(*key[0])
-            b = self.vertex_to_widget_coords(*key[1])
+            a = vertex_to_target(*key[0])
+            b = vertex_to_target(*key[1])
             painter.setPen(QPen(
                 color, line_w, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin
             ))
             painter.drawLine(a, b)
+
+    def render_export_image(self) -> QImage:
+        """
+        補正後画像の元解像度（周囲の黒帯なし）で、セル塗り・仮想グリッド・
+        自由手書き・塗った線を合成した保存用 QImage を生成する。
+        （ホバーハイライトや枠調整ハンドル等の一時UI表示は除外する）
+        """
+        if self.pixmap.isNull():
+            return QImage()
+        out_img = QImage(
+            self.pixmap.width(),
+            self.pixmap.height(),
+            QImage.Format.Format_RGB32,
+        )
+        painter = QPainter(out_img)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self._render_scene(
+            painter, scale=1.0, ox=0.0, oy=0.0, include_active_stroke=False
+        )
+        painter.end()
+        return out_img
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor(25, 25, 28))
+
+        if self.pixmap.isNull():
+            painter.setPen(QColor(160, 160, 160))
+            painter.setFont(QFont("Arial", 14))
+            painter.drawText(
+                self.rect(),
+                Qt.AlignmentFlag.AlignCenter,
+                "補正後画像がありません。\nまずは四隅を指定して「補正してサンドボックスへ」を実行してください。"
+            )
+            return
+
+        scale, ox, oy = self.get_display_scale_and_offset()
+        self._render_scene(painter, scale, ox, oy, include_active_stroke=True)
 
         # 枠調整モード: 外枠とハンドルを強調表示
         if self.draw_mode == DrawMode.GRID_ADJUST:
@@ -1254,7 +1402,7 @@ class SandboxCanvas(QWidget):
             a = self.vertex_to_widget_coords(*self.hovered_edge[0])
             b = self.vertex_to_widget_coords(*self.hovered_edge[1])
             painter.setPen(QPen(
-                QColor(255, 255, 255, 120), line_w, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap
+                QColor(255, 255, 255, 120), self.line_width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap
             ))
             painter.drawLine(a, b)
 
@@ -1902,8 +2050,9 @@ class MainWindow(QMainWindow):
         target_hwnd = 0
         try:
             own_hwnd = int(self.winId())
-            # グローバルホットキー経由ではゲームが前面のまま。ここで対象を確定する
-            target_hwnd = int(ctypes.windll.user32.GetForegroundWindow())
+            if hasattr(ctypes, "windll"):
+                # グローバルホットキー経由ではゲームが前面のまま。ここで対象を確定する
+                target_hwnd = int(ctypes.windll.user32.GetForegroundWindow())
         except Exception:
             pass
 
@@ -1918,11 +2067,17 @@ class MainWindow(QMainWindow):
             time.sleep(0.01)
 
         try:
-            # 自アプリが前面だった場合は、隠した後に前面になったウィンドウを対象にする
+            # 自アプリが前面だった場合は、隠した後に前面になったウィンドウを対象にする (非Windows環境はスキップ)
             if not target_hwnd or target_hwnd == own_hwnd:
-                target_hwnd = int(ctypes.windll.user32.GetForegroundWindow())
+                try:
+                    if hasattr(ctypes, "windll"):
+                        target_hwnd = int(ctypes.windll.user32.GetForegroundWindow())
+                except Exception:
+                    target_hwnd = 0
 
-            bgr = capture_foreground_window_bgr(target_hwnd, exclude_hwnd=own_hwnd)
+            bgr = capture_foreground_window_bgr(
+                target_hwnd or None, exclude_hwnd=own_hwnd or None
+            )
 
             self.captured_bgr = bgr
             self.perspective_canvas.set_image(bgr)
@@ -1944,15 +2099,10 @@ class MainWindow(QMainWindow):
         if not filepath:
             return
 
-        # 日本語パス対応の読み込み
-        stream = open(filepath, "rb")
-        bytes_data = bytearray(stream.read())
-        stream.close()
-        numpy_array = np.asarray(bytes_data, dtype=np.uint8)
-        img_bgr = cv2.imdecode(numpy_array, cv2.IMREAD_COLOR)
-
-        if img_bgr is None:
-            QMessageBox.warning(self, "エラー", "画像の読み込みに失敗しました。")
+        try:
+            img_bgr = load_image_bgr(filepath)
+        except (OSError, ValueError) as e:
+            QMessageBox.warning(self, "画像読込エラー", f"画像の読み込みに失敗しました:\n{e}")
             return
 
         self.captured_bgr = img_bgr
@@ -1984,6 +2134,11 @@ class MainWindow(QMainWindow):
         pts = None
         if len(self.perspective_canvas.points) == 4:
             pts = np.array([[p.x(), p.y()] for p in self.perspective_canvas.points], dtype="float32")
+            try:
+                validate_quad_points(pts)
+            except ValueError as e:
+                QMessageBox.warning(self, "四隅指定エラー", f"四隅の指定が不正です:\n{e}")
+                return
 
         img_to_analyze = self.captured_bgr
         if pts is None and self.warped_bgr is not None:
@@ -2030,6 +2185,7 @@ class MainWindow(QMainWindow):
         pts = np.array([[p.x(), p.y()] for p in self.perspective_canvas.points], dtype="float32")
 
         try:
+            validate_quad_points(pts)
             # 補正前に自動でグリッド線（マス目数）を自動検知
             detected_cols, detected_rows, detected_margin = detect_grid_dimensions(self.captured_bgr, pts)
             if detected_cols > 8 or detected_rows > 8 or detected_cols < 3 or detected_rows < 3:
@@ -2167,19 +2323,32 @@ class MainWindow(QMainWindow):
         )
 
     def action_save_sandbox_image(self):
-        """現在のサンドボックスキャンバスの内容を画像ファイルに保存する。"""
+        """現在のサンドボックスキャンバスの内容を元解像度画像ファイルとして保存する。"""
         if self.sandbox_canvas.pixmap.isNull():
             return
 
-        filepath, _ = QFileDialog.getSaveFileName(
-            self, "考察画像を保存", "witness_sandbox_solution.png", "PNG画像 (*.png);;JPEG画像 (*.jpg)"
+        filepath, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "考察画像を保存",
+            "witness_sandbox_solution.png",
+            "PNG画像 (*.png);;JPEG画像 (*.jpg *.jpeg)",
         )
         if not filepath:
             return
 
-        # キャンバス全体をレンダリングして保存
-        img = self.sandbox_canvas.grab()
-        if img.save(filepath):
+        filepath = normalize_save_image_path(filepath, selected_filter)
+        export_img = self.sandbox_canvas.render_export_image()
+        if export_img.isNull():
+            QMessageBox.warning(self, "保存失敗", "保存用画像の生成に失敗しました。")
+            return
+
+        try:
+            saved = export_img.save(filepath)
+        except Exception as e:
+            QMessageBox.warning(self, "保存失敗", f"画像の保存中にエラーが発生しました:\n{e}")
+            return
+
+        if saved:
             QMessageBox.information(self, "保存完了", f"画像を保存しました:\n{filepath}")
         else:
             QMessageBox.warning(self, "保存失敗", "画像の保存に失敗しました。")
