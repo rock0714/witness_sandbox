@@ -39,8 +39,9 @@ try:
 except ImportError:
     wintypes = None  # type: ignore[assignment]
 
-# Windows API 定数
+# Windows API 定数 (グローバルホットキー RegisterHotKey / WM_HOTKEY 用)
 MOD_NONE = 0x0000
+MOD_NOREPEAT = 0x4000
 VK_F4 = 0x73
 WM_HOTKEY = 0x0312
 HOTKEY_ID_F4 = 1001
@@ -1675,6 +1676,8 @@ class MainWindow(QMainWindow):
         # 現在保持しているキャプチャ画像 (BGR) と補正後画像 (BGR)
         self.captured_bgr: np.ndarray | None = None
         self.warped_bgr: np.ndarray | None = None
+        self._registered_hotkey_hwnd: int | None = None
+        self._is_closed: bool = False
 
         # ホットキーシグナラー
         self.hotkey_signaler = HotkeySignaler()
@@ -1691,7 +1694,10 @@ class MainWindow(QMainWindow):
         self.action_load_sample()
 
         # グローバルホットキー (F4) はUIの描画完了後に安全に登録
-        QTimer.singleShot(600, self._register_global_hotkey)
+        self._hotkey_init_timer = QTimer(self)
+        self._hotkey_init_timer.setSingleShot(True)
+        self._hotkey_init_timer.timeout.connect(self._register_global_hotkey)
+        self._hotkey_init_timer.start(600)
 
     def center_on_screen(self):
         """ウィンドウをデスクトップ画面の中央に配置する。"""
@@ -1957,22 +1963,84 @@ class MainWindow(QMainWindow):
         frame.setVisible(False)
         return frame
 
-    def _register_global_hotkey(self):
-        """グローバルホットキー (F4) の安全な登録"""
+    def _register_global_hotkey(self) -> bool:
+        """Win32 RegisterHotKey によりグローバルホットキー (F4) を安全に登録する。"""
+        self._unregister_global_hotkey()
+        if self._is_closed:
+            return False
+        if not hasattr(ctypes, "windll") or wintypes is None:
+            print(
+                "[Info] 非Windows環境のためグローバルホットキー登録をスキップしました (アプリ内F4キーやボタンで操作可能)。",
+                flush=True,
+            )
+            return False
+
         try:
-            import keyboard
-            keyboard.add_hotkey("F4", lambda: self.hotkey_signaler.capture_requested.emit())
-            print("[Info] グローバルホットキー (F4) を登録しました。", flush=True)
+            hwnd = int(self.winId())
+            if not hwnd:
+                return False
+            user32 = ctypes.windll.user32
+            # 押しっぱなし連打を防ぐ MOD_NOREPEAT 付きを優先し、非対応環境では MOD_NONE にフォールバック
+            ok = bool(
+                user32.RegisterHotKey(
+                    wintypes.HWND(hwnd), HOTKEY_ID_F4, MOD_NONE | MOD_NOREPEAT, VK_F4
+                )
+            )
+            if not ok:
+                ok = bool(
+                    user32.RegisterHotKey(
+                        wintypes.HWND(hwnd), HOTKEY_ID_F4, MOD_NONE, VK_F4
+                    )
+                )
+            if ok:
+                self._registered_hotkey_hwnd = hwnd
+                print("[Info] グローバルホットキー (F4) を登録しました。", flush=True)
+                return True
+            print(
+                "[Info] グローバルホットキー (F4) は他アプリで使用中のため登録をスキップしました (アプリ内F4キーやボタンで操作可能)。",
+                flush=True,
+            )
+            return False
         except Exception as e:
-            print(f"[Info] グローバルホットキーの登録をスキップしました (アプリ内F4キーやボタンで操作可能): {e}", flush=True)
+            print(
+                f"[Info] グローバルホットキーの登録をスキップしました (アプリ内F4キーやボタンで操作可能): {e}",
+                flush=True,
+            )
+            return False
+
+    def _unregister_global_hotkey(self):
+        """登録済みの Win32 グローバルホットキーを解除する。"""
+        hwnd = self._registered_hotkey_hwnd
+        self._registered_hotkey_hwnd = None
+        if not hwnd or not hasattr(ctypes, "windll") or wintypes is None:
+            return
+        try:
+            ctypes.windll.user32.UnregisterHotKey(wintypes.HWND(hwnd), HOTKEY_ID_F4)
+        except Exception:
+            pass
+
+    def nativeEvent(self, eventType, message):
+        """Windows ネイティブメッセージ (WM_HOTKEY) を受信して画面キャプチャを発火する。"""
+        try:
+            if wintypes is not None and bytes(eventType) in (
+                b"windows_generic_MSG",
+                b"windows_dispatcher_MSG",
+            ):
+                addr = int(message)
+                if addr:
+                    msg = wintypes.MSG.from_address(addr)
+                    if msg.message == WM_HOTKEY and int(msg.wParam) == HOTKEY_ID_F4:
+                        QTimer.singleShot(0, self.hotkey_signaler.capture_requested.emit)
+                        return True, 0
+        except Exception:
+            pass
+        return super().nativeEvent(eventType, message)
 
     def closeEvent(self, event):
         """アプリ終了処理"""
-        try:
-            import keyboard
-            keyboard.unhook_all_hotkeys()
-        except Exception:
-            pass
+        self._is_closed = True
+        self._hotkey_init_timer.stop()
+        self._unregister_global_hotkey()
         event.accept()
 
     def keyPressEvent(self, event):
@@ -2090,6 +2158,11 @@ class MainWindow(QMainWindow):
                 self.show()
                 self.raise_()
                 self.activateWindow()
+                if (
+                    self._registered_hotkey_hwnd is not None
+                    and int(self.winId()) != self._registered_hotkey_hwnd
+                ):
+                    self._register_global_hotkey()
 
     def action_open_file(self):
         """ローカル画像ファイルを開く。"""
@@ -2296,7 +2369,11 @@ class MainWindow(QMainWindow):
 
 
     def action_toggle_topmost(self, checked: bool):
-        """最前面表示トグル"""
+        """最前面表示トグル (setWindowFlags による HWND 再生成時もホットキーを維持)"""
+        was_hotkey_registered = self._registered_hotkey_hwnd is not None
+        if was_hotkey_registered:
+            self._unregister_global_hotkey()
+
         flags = self.windowFlags()
         if checked:
             flags |= Qt.WindowType.WindowStaysOnTopHint
@@ -2304,6 +2381,9 @@ class MainWindow(QMainWindow):
             flags &= ~Qt.WindowType.WindowStaysOnTopHint
         self.setWindowFlags(flags)
         self.show()
+
+        if was_hotkey_registered:
+            self._register_global_hotkey()
 
     def action_choose_color(self):
         """カラーピッカーダイアログを表示する。"""
