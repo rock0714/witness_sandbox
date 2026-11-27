@@ -610,9 +610,10 @@ class SandboxCanvas(QWidget):
         self.freehand_strokes: list[dict] = []
         self.active_stroke: list[QPointF] = []  # 元画像座標系での描画中ストローク点列
 
-        # 4. 操作履歴 (Undo用)
-        # 各要素: {"type": "path"|"fill"|"stroke", "data": ...}
+        # 4. 操作履歴 (Undo用) と 1操作トランザクション開始状態
+        # 各要素: {"type": "snapshot"|"edge"|"fill"|"add_stroke"|"remove_stroke", ...}
         self.undo_stack: list[dict] = []
+        self._tx_start_state: dict | None = None
 
         self.setMouseTracking(True)
 
@@ -629,47 +630,154 @@ class SandboxCanvas(QWidget):
         self.cols = max(1, cols)
         self.update()
 
-    def set_margin_percent(self, percent: float):
-        """マージン割合を更新する (0.0 ~ 0.3)。"""
+    def set_margin_percent(self, percent: float, record_undo: bool = False):
+        """マージン割合を更新する (0.0 ~ 0.35)。record_undo=True 時は変更前状態を履歴に記録する。"""
+        prev_state = (
+            self._capture_state()
+            if (record_undo and self._tx_start_state is None)
+            else None
+        )
         self.margin_percent = max(0.0, min(0.35, percent))
         m = self.margin_percent
         self.grid_rect = [m, m, 1.0 - m, 1.0 - m]
+        if prev_state is not None and not self._states_equal(prev_state, self._capture_state()):
+            self.undo_stack.append({"type": "snapshot", "state": prev_state})
         self.update()
 
     def set_draw_mode(self, mode: int):
         """描画モードを切り替える。"""
+        self.active_stroke.clear()
+        self.commit_undo_transaction()
         self.draw_mode = mode
         self.edge_drag_mode = None
         self.adjust_flags = None
         self.setCursor(Qt.CursorShape.ArrowCursor)
-        self.active_stroke.clear()
         self.update()
 
     def set_color(self, color: QColor):
         """描画色を設定する。"""
         self.current_color = color
 
-    def clear_all(self, clear_history=False):
-        """描画内容を全消去する。"""
-        self.edges.clear()
-        self.cell_fills.clear()
-        self.freehand_strokes.clear()
+    # --------------------------------------------------------------------------
+    # Undo スナップショット・トランザクション管理
+    # --------------------------------------------------------------------------
+
+    def _capture_state(self) -> dict:
+        """現在の描画内容およびグリッド外枠のディープコピーを取得する。"""
+        return {
+            "edges": {k: QColor(v) for k, v in self.edges.items()},
+            "cell_fills": {k: QColor(v) for k, v in self.cell_fills.items()},
+            "freehand_strokes": [
+                {
+                    "points": [QPointF(p) for p in s.get("points", [])],
+                    "color": QColor(s["color"]),
+                    "width": s["width"],
+                }
+                for s in self.freehand_strokes
+            ],
+            "grid_rect": list(self.grid_rect),
+        }
+
+    @staticmethod
+    def _states_equal(s1: dict, s2: dict) -> bool:
+        """2つのスナップショット間に実質的な変化がないかを判定する。"""
+        if s1["edges"] != s2["edges"]:
+            return False
+        if s1["cell_fills"] != s2["cell_fills"]:
+            return False
+        strokes1 = s1["freehand_strokes"]
+        strokes2 = s2["freehand_strokes"]
+        if len(strokes1) != len(strokes2):
+            return False
+        for st1, st2 in zip(strokes1, strokes2):
+            if st1["color"] != st2["color"] or st1["width"] != st2["width"]:
+                return False
+            pts1, pts2 = st1["points"], st2["points"]
+            if len(pts1) != len(pts2):
+                return False
+            for p1, p2 in zip(pts1, pts2):
+                if abs(p1.x() - p2.x()) > 1e-6 or abs(p1.y() - p2.y()) > 1e-6:
+                    return False
+        r1, r2 = s1["grid_rect"], s2["grid_rect"]
+        if any(abs(a - b) > 1e-9 for a, b in zip(r1, r2)):
+            return False
+        return True
+
+    def _restore_state(self, state: dict):
+        """スナップショットから描画内容およびグリッド外枠を復元する。"""
+        prev_rect = list(self.grid_rect)
+        self.edges = {k: QColor(v) for k, v in state["edges"].items()}
+        self.cell_fills = {k: QColor(v) for k, v in state["cell_fills"].items()}
+        self.freehand_strokes = [
+            {
+                "points": [QPointF(p) for p in s.get("points", [])],
+                "color": QColor(s["color"]),
+                "width": s["width"],
+            }
+            for s in state["freehand_strokes"]
+        ]
+        new_rect = list(state["grid_rect"])
+        self.grid_rect = new_rect
+        if any(abs(a - b) > 1e-9 for a, b in zip(prev_rect, new_rect)):
+            self.grid_rect_changed.emit()
+        self.update()
+
+    def begin_undo_transaction(self):
+        """1操作単位の Undo トランザクションを開始する。"""
+        if self._tx_start_state is not None:
+            self.commit_undo_transaction()
+        self._tx_start_state = self._capture_state()
+
+    def commit_undo_transaction(self) -> bool:
+        """進行中の Undo トランザクションを確定し、変化があれば1件だけ履歴に記録する。"""
+        if self._tx_start_state is None:
+            return False
+        start_state = self._tx_start_state
+        self._tx_start_state = None
+        curr_state = self._capture_state()
+        if not self._states_equal(start_state, curr_state):
+            self.undo_stack.append({"type": "snapshot", "state": start_state})
+            return True
+        return False
+
+    def clear_all(self, clear_history: bool = False):
+        """描画内容を全消去する。clear_history=False 時は消去前状態を Undo 可能に記録する。"""
         self.active_stroke.clear()
         if clear_history:
+            self._tx_start_state = None
+            self.edges.clear()
+            self.cell_fills.clear()
+            self.freehand_strokes.clear()
             self.undo_stack.clear()
         else:
-            self.undo_stack.append({"type": "clear_snapshot"})
+            self.commit_undo_transaction()
+            has_drawings = bool(self.edges or self.cell_fills or self.freehand_strokes)
+            if has_drawings:
+                prev_state = self._capture_state()
+                self.edges.clear()
+                self.cell_fills.clear()
+                self.freehand_strokes.clear()
+                self.undo_stack.append({"type": "snapshot", "state": prev_state})
         self.update()
 
     def undo(self):
         """直前の操作を1つ取り消す。"""
+        if self._tx_start_state is not None:
+            self.active_stroke.clear()
+            self.edge_drag_mode = None
+            self.adjust_flags = None
+            self.commit_undo_transaction()
+
         if not self.undo_stack:
             return
 
         action = self.undo_stack.pop()
         action_type = action["type"]
 
-        if action_type == "edge":
+        if action_type == "snapshot":
+            self._restore_state(action["state"])
+            return
+        elif action_type == "edge":
             key = action["edge"]
             prev_color = action["prev_color"]
             if prev_color is None:
@@ -737,17 +845,24 @@ class SandboxCanvas(QWidget):
         return best_key
 
     def apply_edge(self, key, mode: str) -> bool:
-        """辺に塗り/消去を適用し、変化があれば Undo に記録する。"""
+        """辺に塗り/消去を適用し、トランザクション外であれば Undo に記録する。"""
         prev = self.edges.get(key)
         if mode == "paint":
             if prev is not None and prev == self.current_color:
                 return False
-            self.edges[key] = self.current_color
+            self.edges[key] = QColor(self.current_color)
         else:
             if prev is None:
                 return False
             self.edges.pop(key)
-        self.undo_stack.append({"type": "edge", "edge": key, "prev_color": prev})
+        if self._tx_start_state is None:
+            self.undo_stack.append(
+                {
+                    "type": "edge",
+                    "edge": key,
+                    "prev_color": QColor(prev) if prev is not None else None,
+                }
+            )
         self.update()
         return True
 
@@ -773,14 +888,15 @@ class SandboxCanvas(QWidget):
         return None
 
     def delete_stroke_at_index(self, idx: int) -> bool:
-        """指定インデックスの手書きストロークを削除し、Undoスタックに記録する。"""
+        """指定インデックスの手書きストロークを削除し、トランザクション外であればUndoスタックに記録する。"""
         if 0 <= idx < len(self.freehand_strokes):
             data = self.freehand_strokes.pop(idx)
-            self.undo_stack.append({
-                "type": "remove_stroke",
-                "index": idx,
-                "data": data
-            })
+            if self._tx_start_state is None:
+                self.undo_stack.append({
+                    "type": "remove_stroke",
+                    "index": idx,
+                    "data": data
+                })
             self.update()
             return True
         return False
@@ -789,6 +905,10 @@ class SandboxCanvas(QWidget):
         """
         消しゴム機能: 指定座標にある塗り辺、セル塗り、または手書きストロークを消去する。
         """
+        standalone_call = self._tx_start_state is None
+        if standalone_call:
+            self.begin_undo_transaction()
+
         erased = False
 
         # 1. 塗られた辺の消去
@@ -799,13 +919,7 @@ class SandboxCanvas(QWidget):
         # 2. セル塗りの消去
         cell = self.find_cell_at_pos(pos)
         if cell in self.cell_fills:
-            prev = self.cell_fills.pop(cell)
-            self.undo_stack.append({
-                "type": "fill",
-                "cell": cell,
-                "prev_color": prev,
-                "new_color": None
-            })
+            self.cell_fills.pop(cell)
             erased = True
 
         # 3. 自由手書きストロークの消去
@@ -813,6 +927,9 @@ class SandboxCanvas(QWidget):
         if hit_stroke_idx is not None:
             self.delete_stroke_at_index(hit_stroke_idx)
             erased = True
+
+        if standalone_call:
+            self.commit_undo_transaction()
 
         if erased:
             self.update()
@@ -1155,6 +1272,7 @@ class SandboxCanvas(QWidget):
             if event.button() == Qt.MouseButton.LeftButton:
                 flags = self.find_adjust_target(pos)
                 if flags is not None:
+                    self.begin_undo_transaction()
                     self.adjust_flags = flags
                     self.adjust_start_pos = pos
                     self.adjust_start_rect = list(self.grid_rect)
@@ -1166,9 +1284,11 @@ class SandboxCanvas(QWidget):
                 return
             if event.button() == Qt.MouseButton.RightButton:
                 # 右クリック: その辺を消去
+                self.begin_undo_transaction()
                 self.apply_edge(edge, "erase")
             elif event.button() == Qt.MouseButton.LeftButton:
                 # 左クリック: トグル。以降のドラッグは同じモード(塗り/消し)で辺をなぞる
+                self.begin_undo_transaction()
                 self.edge_drag_mode = self.toggle_edge(edge)
                 self.last_drag_pos = pos
 
@@ -1186,35 +1306,30 @@ class SandboxCanvas(QWidget):
 
 
         elif self.draw_mode == DrawMode.CELL_FILL:
-            # マス目塗りつぶし
-            cell = self.find_cell_at_pos(pos)
-            if cell is not None:
-                prev_color = self.cell_fills.get(cell)
-                if event.button() == Qt.MouseButton.RightButton or prev_color == self.current_color:
-                    # すでに同じ色なら消去 (トグル消去)
-                    self.cell_fills.pop(cell, None)
-                    new_color = None
-                else:
-                    self.cell_fills[cell] = self.current_color
-                    new_color = self.current_color
-
-                self.undo_stack.append({
-                    "type": "fill",
-                    "cell": cell,
-                    "prev_color": prev_color,
-                    "new_color": new_color
-                })
-                self.update()
+            # マス目塗りつぶし (余白からのドラッグ進入でも記録されるよう押下時点でトランザクション開始)
+            if event.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
+                self.begin_undo_transaction()
+                cell = self.find_cell_at_pos(pos)
+                if cell is not None:
+                    prev_color = self.cell_fills.get(cell)
+                    if event.button() == Qt.MouseButton.RightButton or prev_color == self.current_color:
+                        # すでに同じ色なら消去 (トグル消去)
+                        self.cell_fills.pop(cell, None)
+                    else:
+                        self.cell_fills[cell] = QColor(self.current_color)
+                    self.update()
 
         elif self.draw_mode == DrawMode.FREEHAND:
             # フリーハンド描画開始 (元画像座標系で記録)
             if event.button() == Qt.MouseButton.LeftButton:
+                self.begin_undo_transaction()
                 self.active_stroke = [self.widget_to_image_coords(pos)]
                 self.update()
 
         elif self.draw_mode == DrawMode.ERASER:
             # 消しゴム: クリック箇所の塗り辺、セル塗り、手書きを消去
             if event.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
+                self.begin_undo_transaction()
                 self.erase_at_pos(pos)
 
     def mouseMoveEvent(self, event):
@@ -1261,7 +1376,17 @@ class SandboxCanvas(QWidget):
                             base_pt = self.vertex_to_widget_coords(*self.drag_base)
                             if math.hypot(sub_pos.x() - base_pt.x(), sub_pos.y() - base_pt.y()) <= threshold:
                                 last_edge = self.op_edges.pop()
-                                self.apply_edge(last_edge, "erase")
+                                # ドラッグ開始前の元の辺状態（未塗りなら削除、既存色があればその色）へ復元
+                                orig_color = (
+                                    self._tx_start_state["edges"].get(last_edge)
+                                    if self._tx_start_state is not None
+                                    else None
+                                )
+                                if orig_color is None:
+                                    self.edges.pop(last_edge, None)
+                                else:
+                                    self.edges[last_edge] = QColor(orig_color)
+                                self.update()
                                 for v in last_edge:
                                     if v in self.op_vertex_edges and last_edge in self.op_vertex_edges[v]:
                                         self.op_vertex_edges[v].remove(last_edge)
@@ -1351,21 +1476,32 @@ class SandboxCanvas(QWidget):
         elif self.draw_mode == DrawMode.CELL_FILL:
             # ドラッグで連続塗りつぶし (左ボタン押下時)
             if event.buttons() & Qt.MouseButton.LeftButton:
+                if self._tx_start_state is None:
+                    self.begin_undo_transaction()
                 cell = self.find_cell_at_pos(pos)
                 if cell is not None and self.cell_fills.get(cell) != self.current_color:
-                    prev = self.cell_fills.get(cell)
-                    self.cell_fills[cell] = self.current_color
-                    self.undo_stack.append({
-                        "type": "fill", "cell": cell, "prev_color": prev, "new_color": self.current_color
-                    })
+                    self.cell_fills[cell] = QColor(self.current_color)
                     self.update()
 
         elif self.draw_mode == DrawMode.ERASER:
             # 消しゴムのドラッグなぞり消去
             if event.buttons() & Qt.MouseButton.LeftButton:
+                if self._tx_start_state is None:
+                    self.begin_undo_transaction()
                 self.erase_at_pos(pos)
 
     def mouseReleaseEvent(self, event):
+        if self.draw_mode == DrawMode.FREEHAND:
+            if self.active_stroke:
+                if len(self.active_stroke) >= 2:
+                    self.freehand_strokes.append({
+                        "points": [QPointF(p) for p in self.active_stroke],
+                        "color": QColor(self.current_color),
+                        "width": 4
+                    })
+                self.active_stroke.clear()
+                self.update()
+
         self.edge_drag_mode = None
         self.last_drag_pos = None
         self.drag_tip = None
@@ -1375,18 +1511,7 @@ class SandboxCanvas(QWidget):
         self.adjust_flags = None
         self.adjust_start_pos = None
         self.adjust_start_rect = None
-
-        if self.draw_mode == DrawMode.FREEHAND:
-            if self.active_stroke:
-                if len(self.active_stroke) >= 2:
-                    self.freehand_strokes.append({
-                        "points": list(self.active_stroke),
-                        "color": self.current_color,
-                        "width": 4
-                    })
-                    self.undo_stack.append({"type": "add_stroke"})
-                self.active_stroke.clear()
-                self.update()
+        self.commit_undo_transaction()
 
 
 # ==============================================================================
@@ -1653,11 +1778,14 @@ class MainWindow(QMainWindow):
 
 
         layout.addWidget(QLabel("マージン"))
+        self._margin_slider_dragging = False
         self.slider_margin = QSlider(Qt.Orientation.Horizontal)
         self.slider_margin.setRange(0, 30)
         self.slider_margin.setValue(5)
         self.slider_margin.setFixedWidth(70)
-        self.slider_margin.valueChanged.connect(lambda v: self.sandbox_canvas.set_margin_percent(v / 100.0))
+        self.slider_margin.sliderPressed.connect(self._on_margin_slider_pressed)
+        self.slider_margin.valueChanged.connect(self._on_margin_slider_changed)
+        self.slider_margin.sliderReleased.connect(self._on_margin_slider_released)
         layout.addWidget(self.slider_margin)
 
         layout.addStretch(1)
@@ -1667,9 +1795,11 @@ class MainWindow(QMainWindow):
         btn_undo.clicked.connect(self.sandbox_canvas.undo)
         layout.addWidget(btn_undo)
 
-        btn_clear = QPushButton("🗑 全消去")
-        btn_clear.clicked.connect(self.sandbox_canvas.clear_all)
-        layout.addWidget(btn_clear)
+        self.btn_clear = QPushButton("🗑 全消去")
+        self.btn_clear.clicked.connect(
+            lambda _checked=False: self.sandbox_canvas.clear_all(clear_history=False)
+        )
+        layout.addWidget(self.btn_clear)
 
         btn_save = QPushButton("💾 保存")
         btn_save.clicked.connect(self.action_save_sandbox_image)
@@ -1874,7 +2004,9 @@ class MainWindow(QMainWindow):
         self.slider_rows.blockSignals(False)
         self.lbl_cols_val.setText(str(cols))
         self.lbl_rows_val.setText(str(rows))
+        self.slider_margin.blockSignals(True)
         self.slider_margin.setValue(int(round(margin * 100)))
+        self.slider_margin.blockSignals(False)
         self.sandbox_canvas.set_grid_dimensions(rows, cols)
         self.sandbox_canvas.set_margin_percent(margin)
 
@@ -1910,7 +2042,9 @@ class MainWindow(QMainWindow):
             self.slider_rows.blockSignals(False)
             self.lbl_cols_val.setText(str(detected_cols))
             self.lbl_rows_val.setText(str(detected_rows))
+            self.slider_margin.blockSignals(True)
             self.slider_margin.setValue(int(round(detected_margin * 100)))
+            self.slider_margin.blockSignals(False)
 
             aspect_mode = self.combo_aspect.currentData() or "square"
             warped = warp_perspective(
@@ -1935,10 +2069,32 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "補正エラー", f"パース補正の実行に失敗しました:\n{e}")
 
+    def _on_margin_slider_pressed(self):
+        """マージンスライダーのドラッグ開始時に Undo トランザクションを開始する。"""
+        self._margin_slider_dragging = True
+        self.sandbox_canvas.begin_undo_transaction()
+
+    def _on_margin_slider_changed(self, val: int):
+        """マージンスライダー値変更ハンドラ (ドラッグ中はトランザクション継続、単発変更は個別記録)。"""
+        self.sandbox_canvas.set_margin_percent(
+            val / 100.0, record_undo=not self._margin_slider_dragging
+        )
+
+    def _on_margin_slider_released(self):
+        """マージンスライダーのドラッグ終了時に Undo トランザクションを確定する。"""
+        self._margin_slider_dragging = False
+        self.sandbox_canvas.commit_undo_transaction()
+
     def _on_grid_rect_changed(self):
-        """枠調整で外枠が変わったとき、マージンスライダーを左マージンの値に同期する (信号は発火させない)。"""
+        """枠調整やUndoで外枠が変わったとき、4辺の平均マージンをスライダー表示に同期する (信号は発火させない)。"""
+        l, t, r, b = self.sandbox_canvas.grid_rect
+        avg_margin_pct = int(round(((l + t + (1.0 - r) + (1.0 - b)) / 4.0) * 100))
+        clamped = max(
+            self.slider_margin.minimum(),
+            min(self.slider_margin.maximum(), avg_margin_pct),
+        )
         self.slider_margin.blockSignals(True)
-        self.slider_margin.setValue(int(round(self.sandbox_canvas.grid_rect[0] * 100)))
+        self.slider_margin.setValue(clamped)
         self.slider_margin.blockSignals(False)
 
     @property
