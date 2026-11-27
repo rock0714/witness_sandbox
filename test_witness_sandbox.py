@@ -1364,6 +1364,125 @@ class TestMainWindowAndCapture(unittest.TestCase):
             saved_img = load_image_bgr(expected_saved)
             self.assertEqual(saved_img.shape, (native_h, native_w, 3))
 
+    def test_win32_register_hotkey_lifecycle_and_native_event(self):
+        """keyboard 非依存で Win32 RegisterHotKey 登録・TopMost再登録・WM_HOTKEY受信・解除が機能すること。"""
+        import pathlib
+        import re
+        from PyQt6 import sip
+        from PyQt6.QtCore import QByteArray
+
+        # 1. requirements.txt と pyproject.toml から keyboard が削除され完全一致していること (Python 3.10 互換フォールバック付き)
+        root = pathlib.Path(__file__).resolve().parent
+        reqs = [
+            line.strip()
+            for line in (root / "requirements.txt").read_text("utf-8").splitlines()
+            if line.strip()
+        ]
+        pyproject_text = (root / "pyproject.toml").read_text("utf-8")
+        try:
+            import tomllib  # Python 3.11+
+            pyproject_deps = tomllib.loads(pyproject_text)["project"]["dependencies"]
+        except ModuleNotFoundError:
+            dep_match = re.search(
+                r"dependencies\s*=\s*\[(.*?)\]", pyproject_text, re.DOTALL
+            )
+            self.assertIsNotNone(dep_match, "pyproject.toml に dependencies が見つかりません")
+            pyproject_deps = re.findall(r'"([^"]+)"', dep_match.group(1))  # type: ignore[union-attr]
+        self.assertEqual(pyproject_deps, reqs)
+        self.assertTrue(all("keyboard" not in dep.lower() for dep in reqs))
+
+        # setUp で当てている _register_global_hotkey のモックを一時解除して実メソッドを検証
+        self._hotkey_patcher.stop()
+        try:
+            # 非 Windows 環境 (wintypes=None または windll 不在) では例外なく False を返すこと
+            with mock.patch.object(main_mod, "wintypes", None):
+                self.assertFalse(self.window._register_global_hotkey())
+            with mock.patch.object(main_mod, "ctypes", new=mock.MagicMock(spec=[])):
+                self.assertFalse(self.window._register_global_hotkey())
+
+            fake_user32 = mock.MagicMock()
+            # 1回目は MOD_NOREPEAT 成功、次は失敗->MOD_NONE フォールバック成功を検証
+            fake_user32.RegisterHotKey.side_effect = [1, 0, 1, 0, 0]
+            fake_user32.UnregisterHotKey.return_value = 1
+            fake_windll = mock.MagicMock()
+            fake_windll.user32 = fake_user32
+            effective_wintypes = (
+                main_mod.wintypes
+                if main_mod.wintypes is not None
+                else mock.MagicMock(HWND=lambda h: h)
+            )
+
+            # keyboard パッケージが存在しない環境でも動作することを強制確認
+            with (
+                mock.patch.dict(sys.modules, {"keyboard": None}),
+                mock.patch.object(main_mod.ctypes, "windll", fake_windll, create=True),
+                mock.patch.object(main_mod, "wintypes", effective_wintypes),
+            ):
+                # 登録成功 (MOD_NOREPEAT)
+                self.assertTrue(self.window._register_global_hotkey())
+                self.assertIsNotNone(self.window._registered_hotkey_hwnd)
+                first_call_args = fake_user32.RegisterHotKey.call_args[0]
+                self.assertEqual(first_call_args[1], main_mod.HOTKEY_ID_F4)
+                self.assertEqual(
+                    first_call_args[2], main_mod.MOD_NONE | main_mod.MOD_NOREPEAT
+                )
+                self.assertEqual(first_call_args[3], main_mod.VK_F4)
+
+                # TopMost 切替時: いったん UnregisterHotKey され、MOD_NONE フォールバックで再登録される
+                self.window.action_toggle_topmost(True)
+                self.assertGreaterEqual(fake_user32.UnregisterHotKey.call_count, 1)
+                self.assertIsNotNone(self.window._registered_hotkey_hwnd)
+
+                # 他アプリ競合時 (RegisterHotKey が両方 0 を返す場合): 例外なく False を返す
+                self.assertFalse(self.window._register_global_hotkey())
+                self.assertIsNone(self.window._registered_hotkey_hwnd)
+
+                # 再登録状態にして close() すると確実に UnregisterHotKey が呼ばれ、遅延タイマー再登録も抑止される
+                fake_user32.RegisterHotKey.side_effect = [1]
+                self.assertTrue(self.window._register_global_hotkey())
+                unreg_before_close = fake_user32.UnregisterHotKey.call_count
+                self.window.close()
+                self.assertEqual(
+                    fake_user32.UnregisterHotKey.call_count, unreg_before_close + 1
+                )
+                self.assertFalse(self.window._hotkey_init_timer.isActive())
+                self.assertFalse(self.window._register_global_hotkey())
+
+            # 2. nativeEvent で WM_HOTKEY (HOTKEY_ID_F4) を受信すると capture_requested が発火すること
+            if main_mod.wintypes is not None:
+                triggered: list[bool] = []
+                self.window.hotkey_signaler.capture_requested.disconnect()
+                self.window.hotkey_signaler.capture_requested.connect(
+                    lambda: triggered.append(True)
+                )
+
+                # 対象外のホットキー ID は無視されて基底へ委譲される
+                other_msg = main_mod.wintypes.MSG()
+                other_msg.message = main_mod.WM_HOTKEY
+                other_msg.wParam = 9999
+                handled, _ = self.window.nativeEvent(
+                    QByteArray(b"windows_generic_MSG"),
+                    sip.voidptr(main_mod.ctypes.addressof(other_msg)),
+                )
+                QApplication.processEvents()
+                self.assertFalse(handled)
+                self.assertEqual(len(triggered), 0)
+
+                # HOTKEY_ID_F4 の WM_HOTKEY で (True, 0) を返し capture_requested が発火する
+                f4_msg = main_mod.wintypes.MSG()
+                f4_msg.message = main_mod.WM_HOTKEY
+                f4_msg.wParam = main_mod.HOTKEY_ID_F4
+                handled, result = self.window.nativeEvent(
+                    QByteArray(b"windows_generic_MSG"),
+                    sip.voidptr(main_mod.ctypes.addressof(f4_msg)),
+                )
+                QApplication.processEvents()
+                self.assertTrue(handled)
+                self.assertEqual(result, 0)
+                self.assertEqual(len(triggered), 1, "WM_HOTKEY でキャプチャ要求が発火していません")
+        finally:
+            self._hotkey_patcher.start()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
