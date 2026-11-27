@@ -1,342 +1,659 @@
 """
-main.py のセルフチェック用自動テストスクリプト
-ヘッドレス環境（QApplication [offscreen]）で主要コンポーネントのロジックを検証する。
+witness_sandbox.py の自動テストスイート。
+オフスクリーン環境（QT_QPA_PLATFORM="offscreen"）で各機能・コンポーネントを
+項目ごとに独立して検証する。
 """
 
-import sys
 import os
-import numpy as np
-import cv2
+import sys
+import unittest
+from unittest import mock
 
-# PyQt6のオフスクリーンモード設定
+# PyQt6 のインポート前にオフスクリーンモードを設定
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
-from PyQt6.QtWidgets import QApplication
+import numpy as np
+from PIL import Image
 from PyQt6.QtCore import QPointF, Qt
 from PyQt6.QtGui import QColor
+from PyQt6.QtTest import QTest
+from PyQt6.QtWidgets import QApplication
 
-# witness_sandbox.py のインポート
+import witness_sandbox as main_mod
 from witness_sandbox import (
-    order_points,
-    warp_perspective,
-    detect_grid_dimensions,
-    point_to_segment_distance,
-    create_sample_witness_image,
-    cv_to_qpixmap,
+    DrawMode,
+    MainWindow,
     PerspectiveCanvas,
     SandboxCanvas,
-    DrawMode,
-    MainWindow
+    create_sample_witness_image,
+    cv_to_qpixmap,
+    detect_grid_dimensions,
+    order_points,
+    point_to_segment_distance,
+    warp_perspective,
 )
 
-def run_tests():
-    print("=== [セルフチェック開始] ===")
-    app = QApplication(sys.argv)
+# プロセス内で単一の QApplication インスタンスを保持
+_QAPP: QApplication | None = None
 
-    # 1. サンプル画像生成テスト
-    print("1. サンプルパズル画像の生成テスト...")
-    sample_img = create_sample_witness_image()
-    assert sample_img is not None, "サンプル画像が生成できませんでした"
-    assert sample_img.shape == (700, 1000, 3), f"サンプル画像の形状が不正です: {sample_img.shape}"
-    print("   -> OK: サンプル画像生成成功 (700x1000)")
-
-    # 2. 四隅点整列ロジックテスト (order_points)
-    print("2. 4点ソート (order_points) テスト...")
-    raw_pts = np.array([
+# サンプル盤面における基準4隅座標
+SAMPLE_RAW_POINTS = np.array(
+    [
         [890, 580],  # 右下
         [220, 110],  # 左上
         [150, 610],  # 左下
         [780, 70],   # 右上
-    ], dtype="float32")
+    ],
+    dtype="float32",
+)
 
-    ordered = order_points(raw_pts)
-    np.testing.assert_allclose(ordered[0], [220, 110], err_msg="TLが一致しません")
-    np.testing.assert_allclose(ordered[1], [780, 70], err_msg="TRが一致しません")
-    np.testing.assert_allclose(ordered[2], [890, 580], err_msg="BRが一致しません")
-    np.testing.assert_allclose(ordered[3], [150, 610], err_msg="BLが一致しません")
-    print("   -> OK: 4点整列成功 (TL, TR, BR, BL)")
 
-    # 3. マス目自動検知 (detect_grid_dimensions) テスト
-    print("3. マス目自動検知 (detect_grid_dimensions) テスト...")
-    det_cols, det_rows, det_margin = detect_grid_dimensions(sample_img, ordered)
-    assert det_cols == 4 and det_rows == 4, f"検知されたマス数が不正です: {det_cols}x{det_rows} (期待値: 4x4)"
-    assert 0.05 <= det_margin <= 0.15, f"検知されたマージンが不正です: {det_margin}"
-    print(f"   -> OK: マス目自動検知成功 ({det_cols}列 x {det_rows}行, マージン: {det_margin*100:.0f}%)")
+def get_qapp() -> QApplication:
+    """オフスクリーン検証用の QApplication インスタンスを取得または生成する。"""
+    global _QAPP
+    instance = QApplication.instance()
+    if instance is not None:
+        return instance  # type: ignore[return-value]
+    _QAPP = QApplication(sys.argv)
+    return _QAPP
 
-    # 4. 正方形(1:1)比率透視投影変換 (warp_perspective) テスト
-    print("4. 正方形(1:1)比率透視投影変換 (warp_perspective) テスト...")
-    warped_sq = warp_perspective(sample_img, ordered, aspect_mode="square")
-    assert warped_sq is not None and warped_sq.size > 0
-    h_sq, w_sq, _ = warped_sq.shape
-    assert h_sq == w_sq, f"正方形比率になっていません: {w_sq}x{h_sq}"
-    print(f"   -> OK: 正方形(1:1)透視変換成功 (サイズ: {w_sq}x{h_sq}, 比率 1:1)")
 
-    # グリッド比率テスト
-    warped_grid = warp_perspective(sample_img, ordered, aspect_mode="grid", cols=6, rows=3)
-    h_gr, w_gr, _ = warped_grid.shape
-    assert abs(w_gr / h_gr - 2.0) < 0.05, f"グリッド比率(6:3=2:1)になっていません: {w_gr}x{h_gr}"
-    print(f"   -> OK: グリッド比率(6:3)透視変換成功 ({w_gr}x{h_gr})")
+# ==============================================================================
+# 1. 幾何計算・画像処理・サンプル生成の単体テスト
+# ==============================================================================
 
-    # 5. 点と線分の最短距離ヘルパーテスト
-    print("5. 幾何計算 (point_to_segment_distance) テスト...")
-    d1 = point_to_segment_distance(5.0, 5.0, 0.0, 0.0, 10.0, 0.0)
-    assert abs(d1 - 5.0) < 1e-5, f"線分との距離が不正: {d1}"
-    d2 = point_to_segment_distance(12.0, 0.0, 0.0, 0.0, 10.0, 0.0)
-    assert abs(d2 - 2.0) < 1e-5, f"端点外の距離が不正: {d2}"
-    print("   -> OK: 最短距離計算正常")
 
-    # 6. PerspectiveCanvas のテスト
-    print("6. PerspectiveCanvas コンポーネントテスト...")
-    p_canvas = PerspectiveCanvas()
-    p_canvas.resize(800, 600)
-    p_canvas.set_image(sample_img)
-    assert not p_canvas.pixmap.isNull()
+class TestGeometryAndVision(unittest.TestCase):
+    """幾何計算・グリッド自動検知・透視投影変換のテスト。"""
 
-    p_canvas.points = [
-        QPointF(220, 110),
-        QPointF(780, 70),
-        QPointF(890, 580),
-        QPointF(150, 610)
-    ]
-    assert len(p_canvas.points) == 4
-    print("   -> OK: PerspectiveCanvas 動作正常")
+    sample_img: np.ndarray
+    ordered_pts: np.ndarray
 
-    # 7. SandboxCanvas (線塗りトグル、ドラッグ塗り、マス目塗り、消しゴム、Undo) テスト
-    print("7. SandboxCanvas テスト...")
-    from PyQt6.QtTest import QTest
-    s_canvas = SandboxCanvas()
-    s_canvas.resize(600, 600)
-    s_canvas.show()
-    s_canvas.set_warped_image(warped_sq)
-    s_canvas.set_grid_dimensions(4, 4)
-    s_canvas.set_margin_percent(det_margin)
-    s_canvas.set_draw_mode(DrawMode.SNAP_LINE)
+    @classmethod
+    def setUpClass(cls):
+        get_qapp()
+        cls.sample_img = create_sample_witness_image()
+        cls.ordered_pts = order_points(SAMPLE_RAW_POINTS)
 
-    # 辺 (0,0)-(1,0) の中点 (ウィジェット座標)
-    a = s_canvas.vertex_to_widget_coords(0, 0)
-    b = s_canvas.vertex_to_widget_coords(1, 0)
-    mid = QPointF((a.x() + b.x()) / 2.0, (a.y() + b.y()) / 2.0)
-    key = ((0, 0), (1, 0))
-    assert s_canvas.find_nearest_edge(mid) == key, "辺の当たり判定に失敗しました"
+    def test_create_sample_witness_image(self):
+        """サンプルパズル画像が期待サイズ (700x1000x3) で生成され QPixmap 変換できること。"""
+        self.assertIsNotNone(self.sample_img, "サンプル画像が生成できませんでした")
+        self.assertEqual(
+            self.sample_img.shape,
+            (700, 1000, 3),
+            f"サンプル画像の形状が不正です: {self.sample_img.shape}",
+        )
+        pixmap = cv_to_qpixmap(self.sample_img)
+        self.assertFalse(pixmap.isNull(), "QPixmap への変換に失敗しました")
 
-    # 実マウスクリックで塗り -> 同じ辺をもう一度クリックで消去
-    QTest.mouseClick(s_canvas, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, mid.toPoint())
-    assert key in s_canvas.edges, "クリックで辺が塗られていません"
-    QTest.mouseClick(s_canvas, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, mid.toPoint())
-    assert key not in s_canvas.edges, "塗り済みの辺を再クリックしても消えません"
-    # Undo (消去を取り消し -> 塗られた状態へ、さらに戻して空へ)
-    s_canvas.undo()
-    assert key in s_canvas.edges, "Undoで消去が復元されていません"
-    s_canvas.undo()
-    assert key not in s_canvas.edges, "Undoで塗りが取り消されていません"
+    def test_order_points(self):
+        """任意の順序の4頂点が [左上, 右上, 右下, 左下] に整列されること。"""
+        ordered = order_points(SAMPLE_RAW_POINTS)
+        np.testing.assert_allclose(ordered[0], [220, 110], err_msg="TLが一致しません")
+        np.testing.assert_allclose(ordered[1], [780, 70], err_msg="TRが一致しません")
+        np.testing.assert_allclose(ordered[2], [890, 580], err_msg="BRが一致しません")
+        np.testing.assert_allclose(ordered[3], [150, 610], err_msg="BLが一致しません")
 
-    # ドラッグ塗り: 上辺 (0,0)->(4,0) を左から右へなぞる
-    start = s_canvas.vertex_to_widget_coords(0, 0)
-    end = s_canvas.vertex_to_widget_coords(4, 0)
-    QTest.mousePress(s_canvas, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPointF(start.x() + 5, start.y()).toPoint())
-    for i in range(1, 41):
-        x = start.x() + 5 + (end.x() - start.x() - 10) * i / 40.0
-        QTest.mouseMove(s_canvas, QPointF(x, start.y()).toPoint())
-    QTest.mouseRelease(s_canvas, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPointF(end.x() - 5, end.y()).toPoint())
-    top_edges = [((c, 0), (c + 1, 0)) for c in range(4)]
-    assert all(e in s_canvas.edges for e in top_edges), f"ドラッグで上辺4本が塗られていません: {list(s_canvas.edges)}"
-    assert len(s_canvas.edges) == 4, f"余計な辺が塗られています: {list(s_canvas.edges)}"
-    # 塗り済みの辺から開始したドラッグは消去モード
-    QTest.mousePress(s_canvas, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPointF(start.x() + 5, start.y()).toPoint())
-    for i in range(1, 41):
-        x = start.x() + 5 + (end.x() - start.x() - 10) * i / 40.0
-        QTest.mouseMove(s_canvas, QPointF(x, start.y()).toPoint())
-    QTest.mouseRelease(s_canvas, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPointF(end.x() - 5, end.y()).toPoint())
-    assert len(s_canvas.edges) == 0, f"ドラッグ消去できていません: {list(s_canvas.edges)}"
-    print("   -> OK: 線塗りトグル・ドラッグ塗り/消去・Undo 正常")
+    def test_detect_grid_dimensions(self):
+        """サンプル画像から列数4・行数4および妥当なマージン割合が自動検知されること。"""
+        det_cols, det_rows, det_margin = detect_grid_dimensions(
+            self.sample_img, self.ordered_pts
+        )
+        self.assertEqual(
+            (det_cols, det_rows),
+            (4, 4),
+            f"検知されたマス数が不正です: {det_cols}x{det_rows} (期待値: 4x4)",
+        )
+        self.assertTrue(
+            0.05 <= det_margin <= 0.15,
+            f"検知されたマージンが不正です: {det_margin}",
+        )
 
-    # 消しゴム機能テスト (erase_at_pos)
-    s_canvas.apply_edge(key, "paint")
-    cell = (1, 1)
-    s_canvas.cell_fills[cell] = QColor(0, 200, 255)
-    s_canvas.freehand_strokes.append({
-        "points": [QPointF(100, 100), QPointF(120, 120)],
-        "color": QColor(255, 255, 255),
-        "width": 4
-    })
-    assert s_canvas.erase_at_pos(mid) is True
-    assert key not in s_canvas.edges, "消しゴムで塗り辺が消去されていません"
-    assert s_canvas.erase_at_pos(QPointF(110, 110)) is True
-    assert len(s_canvas.freehand_strokes) == 0, "消しゴムで手書きストロークが消去されていません"
-    cell_wpt = s_canvas.vertex_to_widget_coords(1, 1)
-    cell_center = QPointF(cell_wpt.x() + 20, cell_wpt.y() + 20)
-    assert s_canvas.erase_at_pos(cell_center) is True
-    assert cell not in s_canvas.cell_fills, "消しゴムでセル塗りが消去されていません"
-    print("   -> OK: 消しゴム機能 (塗り辺・手書き・セル塗り消去) 正常")
+    def test_warp_perspective_square(self):
+        """正方形 (1:1) モードの透視投影変換で縦横同サイズの画像が得られること。"""
+        warped_sq = warp_perspective(
+            self.sample_img, self.ordered_pts, aspect_mode="square"
+        )
+        self.assertIsNotNone(warped_sq)
+        self.assertGreater(warped_sq.size, 0)
+        h_sq, w_sq, _ = warped_sq.shape
+        self.assertEqual(h_sq, w_sq, f"正方形比率になっていません: {w_sq}x{h_sq}")
 
-    # 7b. 枠調整 (グリッド外枠の位置・サイズをドラッグで変更) テスト
-    print("7b. 枠調整テスト...")
-    s_canvas.clear_all(clear_history=True)
-    s_canvas.set_margin_percent(0.30)
-    s_canvas.set_draw_mode(DrawMode.GRID_ADJUST)
-    r0 = list(s_canvas.grid_rect)
-    # 左上の角を外側(左上)へドラッグ -> left/top が小さくなり、right/bottom は不変
-    tl = s_canvas.vertex_to_widget_coords(0, 0)
-    QTest.mousePress(s_canvas, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, tl.toPoint())
-    QTest.mouseMove(s_canvas, QPointF(tl.x() - 60, tl.y() - 60).toPoint())
-    QTest.mouseRelease(s_canvas, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPointF(tl.x() - 60, tl.y() - 60).toPoint())
-    r1 = s_canvas.grid_rect
-    assert r1[0] < r0[0] and r1[1] < r0[1], f"角ドラッグで外枠が広がっていません: {r0} -> {r1}"
-    assert abs(r1[2] - r0[2]) < 1e-6 and abs(r1[3] - r0[3]) < 1e-6, "反対側の辺が動いてしまいました"
-    # 右辺の中点を外側へドラッグ -> rightのみ増加
-    handles = s_canvas.grid_handle_positions()
-    rp = handles["r"]
-    QTest.mousePress(s_canvas, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, rp.toPoint())
-    QTest.mouseMove(s_canvas, QPointF(rp.x() + 40, rp.y()).toPoint())
-    QTest.mouseRelease(s_canvas, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPointF(rp.x() + 40, rp.y()).toPoint())
-    r2 = s_canvas.grid_rect
-    assert r2[2] > r1[2] and abs(r2[0] - r1[0]) < 1e-6 and abs(r2[3] - r1[3]) < 1e-6, f"辺ドラッグが不正: {r1} -> {r2}"
-    # 内側ドラッグ -> サイズを保ったまま移動
-    c = s_canvas.vertex_to_widget_coords(2, 2)
-    w0, h0 = r2[2] - r2[0], r2[3] - r2[1]
-    QTest.mousePress(s_canvas, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, c.toPoint())
-    QTest.mouseMove(s_canvas, QPointF(c.x() + 20, c.y() + 10).toPoint())
-    QTest.mouseRelease(s_canvas, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPointF(c.x() + 20, c.y() + 10).toPoint())
-    r3 = s_canvas.grid_rect
-    assert abs((r3[2] - r3[0]) - w0) < 1e-6 and abs((r3[3] - r3[1]) - h0) < 1e-6, "全体移動でサイズが変わりました"
-    assert r3[0] != r2[0], "全体移動できていません"
-    # 枠調整中は線が塗られない
-    assert len(s_canvas.edges) == 0
-    s_canvas.set_draw_mode(DrawMode.SNAP_LINE)
-    print("   -> OK: 枠調整 (角/辺/全体移動) 正常")
+    def test_warp_perspective_grid_aspect(self):
+        """グリッド比率 (6:3=2:1) モードの透視投影変換で指定アスペクト比になること。"""
+        warped_grid = warp_perspective(
+            self.sample_img, self.ordered_pts, aspect_mode="grid", cols=6, rows=3
+        )
+        h_gr, w_gr, _ = warped_grid.shape
+        self.assertLess(
+            abs(w_gr / h_gr - 2.0),
+            0.05,
+            f"グリッド比率(6:3=2:1)になっていません: {w_gr}x{h_gr}",
+        )
 
-    # 8. MainWindow 統合テスト (マス目検知・正方形補正)
-    print("8. MainWindow 統合テスト...")
-    window = MainWindow()
-    assert window.captured_bgr is not None
-    assert window.stack.currentIndex() == 0
+    def test_point_to_segment_distance(self):
+        """点と線分の最短ユークリッド距離（線分上投影および端点外）が正確であること。"""
+        d1 = point_to_segment_distance(5.0, 5.0, 0.0, 0.0, 10.0, 0.0)
+        self.assertAlmostEqual(d1, 5.0, places=5, msg=f"線分との距離が不正: {d1}")
 
-    # 4隅を設定
-    window.perspective_canvas.points = [
-        QPointF(220, 110),
-        QPointF(780, 70),
-        QPointF(890, 580),
-        QPointF(150, 610)
-    ]
-    window._on_perspective_points_updated(window.perspective_canvas.points)
-    assert window.btn_warp.isEnabled()
-    assert window.btn_detect_grid.isEnabled()
+        d2 = point_to_segment_distance(12.0, 0.0, 0.0, 0.0, 10.0, 0.0)
+        self.assertAlmostEqual(d2, 2.0, places=5, msg=f"端点外の距離が不正: {d2}")
 
-    # 「マス目検知」ボタンの実行
-    window.action_detect_grid()
-    assert window.spin_cols.value() == 4 and window.spin_rows.value() == 4, "マス目検知値が反映されていません"
 
-    # 補正実行 (デフォルト: 正方形 1:1)
-    window.action_execute_warp()
-    assert window.stack.currentIndex() == 1
-    assert window.warped_bgr is not None
-    h, w, _ = window.warped_bgr.shape
-    assert h == w, f"補正画像が正方形(1:1)になっていません: {w}x{h}"
-    print(f"   -> OK: MainWindow 統合テスト成功 (マス目検知 4x4, 正方形補正 {w}x{h})")
+# ==============================================================================
+# 2. PerspectiveCanvas コンポーネントのテスト
+# ==============================================================================
 
-    # 9. F4キャプチャ (前面ウィンドウのみ撮影・自アプリ非表示) のロジックテスト (モック)
-    print("9. F4キャプチャ (前面ウィンドウのみ) テスト...")
-    from unittest import mock
-    from PIL import Image
-    import witness_sandbox as main_mod
 
-    grab_calls = []
+class TestPerspectiveCanvas(unittest.TestCase):
+    """四隅指定キャンバス (PerspectiveCanvas) のテスト。"""
 
-    def fake_grab(bbox=None, all_screens=False, **kw):
-        grab_calls.append(bbox)
-        w, h = (bbox[2] - bbox[0], bbox[3] - bbox[1]) if bbox else (1920, 1080)
-        return Image.new("RGB", (w, h), (10, 20, 30))
+    sample_img: np.ndarray
 
-    # 前面ウィンドウの矩形が取れる場合: bbox 指定で撮影される (全画面ではない)
-    with mock.patch.object(main_mod.ImageGrab, "grab", side_effect=fake_grab), \
-         mock.patch.object(main_mod, "get_window_rect", return_value=(100, 50, 740, 530)):
-        img = main_mod.capture_foreground_window_bgr(target_hwnd=1234, exclude_hwnd=9999)
-    assert grab_calls[-1] == (100, 50, 740, 530), f"前面ウィンドウ矩形で撮影されていません: {grab_calls[-1]}"
-    assert img.shape == (480, 640, 3), f"撮影サイズが不正です: {img.shape}"
+    @classmethod
+    def setUpClass(cls):
+        get_qapp()
+        cls.sample_img = create_sample_witness_image()
 
-    # 対象が自アプリ、または矩形が取れない場合は全画面にフォールバック
-    with mock.patch.object(main_mod.ImageGrab, "grab", side_effect=fake_grab), \
-         mock.patch.object(main_mod, "get_window_rect", return_value=(100, 50, 740, 530)):
-        main_mod.capture_foreground_window_bgr(target_hwnd=9999, exclude_hwnd=9999)
-    assert grab_calls[-1] is None, "自アプリが対象のときは全画面フォールバックになるべきです"
-    with mock.patch.object(main_mod.ImageGrab, "grab", side_effect=fake_grab), \
-         mock.patch.object(main_mod, "get_window_rect", return_value=None):
-        main_mod.capture_foreground_window_bgr(target_hwnd=1234, exclude_hwnd=9999)
-    assert grab_calls[-1] is None, "矩形取得失敗時は全画面フォールバックになるべきです"
+    def setUp(self):
+        self.canvas = PerspectiveCanvas()
+        self.canvas.resize(800, 600)
 
-    # action_capture_screen: 撮影時に自アプリが非表示で、撮影後に再表示される
-    cap_window = MainWindow()
-    cap_window.show()
-    state = {}
+    def tearDown(self):
+        self.canvas.close()
+        self.canvas.deleteLater()
 
-    def fake_capture(target_hwnd=None, exclude_hwnd=None):
-        state["visible_during_capture"] = cap_window.isVisible()
-        state["target"] = target_hwnd
-        return np.zeros((300, 400, 3), dtype=np.uint8)
+    def test_set_image_and_four_points(self):
+        """画像のセットで QPixmap が生成され、4隅の座標を保持できること。"""
+        self.canvas.set_image(self.sample_img)
+        self.assertFalse(self.canvas.pixmap.isNull(), "Pixmap が空です")
 
-    with mock.patch.object(main_mod, "capture_foreground_window_bgr", side_effect=fake_capture):
-        cap_window.action_capture_screen()
-    assert state.get("visible_during_capture") is False, "撮影中に本アプリが表示されたままです (写り込みの原因)"
-    assert cap_window.isVisible(), "撮影後に本アプリが再表示されていません"
-    assert cap_window.captured_bgr.shape == (300, 400, 3), "キャプチャ画像が反映されていません"
-    # 10. 追加仕様テスト (add_fuction.txt)
-    print("10. 追加仕様テスト (1操作1方向制限、3本目描画、行・列スライダー)...")
+        self.canvas.points = [
+            QPointF(220, 110),
+            QPointF(780, 70),
+            QPointF(890, 580),
+            QPointF(150, 610),
+        ]
+        self.assertEqual(len(self.canvas.points), 4, "4点が保持されていません")
 
-    # 10a. 1操作で1方向にしか線が伸びないことのテスト
-    test_sb = SandboxCanvas()
-    test_sb.resize(600, 600)
-    test_sb.show()
-    test_sb.set_warped_image(warped_sq)
-    test_sb.set_grid_dimensions(4, 4)
-    test_sb.set_draw_mode(DrawMode.SNAP_LINE)
 
-    p11 = test_sb.vertex_to_widget_coords(1, 1)
-    p21 = test_sb.vertex_to_widget_coords(2, 1)
-    p22 = test_sb.vertex_to_widget_coords(2, 2)
-    p31 = test_sb.vertex_to_widget_coords(3, 1)
-    mid_11_21 = QPointF((p11.x() + p21.x()) / 2.0, (p11.y() + p21.y()) / 2.0)
-    mid_21_31 = QPointF((p21.x() + p31.x()) / 2.0, (p21.y() + p31.y()) / 2.0)
+# ==============================================================================
+# 3. SandboxCanvas コンポーネントのテスト
+# ==============================================================================
 
-    # 辺 ((1,1), (2,1)) の中点を押下して (2,1) から (2,2) へ下方向へドラッグ
-    QTest.mousePress(test_sb, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, mid_11_21.toPoint())
-    assert ((1, 1), (2, 1)) in test_sb.edges
-    assert len(test_sb.edges) == 1
 
-    for i in range(1, 11):
-        pt = QPointF(p21.x(), p21.y() + (p22.y() - p21.y()) * i / 10.0)
-        QTest.mouseMove(test_sb, pt.toPoint())
-    assert ((2, 1), (2, 2)) in test_sb.edges
-    assert len(test_sb.edges) == 2
+class TestSandboxCanvas(unittest.TestCase):
+    """サンドボックス描画キャンバス (SandboxCanvas) の独立機能テスト。"""
 
-    # ここで (2,1) から (3,1) の方向（分岐）にマウスが触れても、先端は (2,2) なので (2,1)-(3,1) は塗られない
-    QTest.mouseMove(test_sb, mid_21_31.toPoint())
-    assert ((2, 1), (3, 1)) not in test_sb.edges, "1操作中に交点から2方向へ同時に伸びてしまっています"
+    warped_sq: np.ndarray
+    det_margin: float
 
-    # マウスを離す
-    QTest.mouseRelease(test_sb, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, p22.toPoint())
+    @classmethod
+    def setUpClass(cls):
+        get_qapp()
+        sample_img = create_sample_witness_image()
+        ordered = order_points(SAMPLE_RAW_POINTS)
+        _, _, cls.det_margin = detect_grid_dimensions(sample_img, ordered)
+        cls.warped_sq = warp_perspective(sample_img, ordered, aspect_mode="square")
 
-    # 10b. 別の操作で同一交点に3本目の線（T字路）が引けることのテスト
-    # 交点 (2,1) には現在 ((1,1),(2,1)) と ((2,1),(2,2)) の2本が接続している
-    # ここに3本目として ((2,1), (3,1)) をクリックして描画
-    QTest.mouseClick(test_sb, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, mid_21_31.toPoint())
-    assert ((2, 1), (3, 1)) in test_sb.edges, "同一交点への3本目の線が描画できませんでした"
-    assert len(test_sb.edges) == 3
-    print("   -> OK: 1操作1方向制限 & 3本目描画 正常")
+    def setUp(self):
+        self.canvas = SandboxCanvas()
+        self.canvas.resize(600, 600)
+        self.canvas.show()
+        self.canvas.set_warped_image(self.warped_sq)
+        self.canvas.set_grid_dimensions(4, 4)
+        self.canvas.set_margin_percent(self.det_margin)
+        self.canvas.set_draw_mode(DrawMode.SNAP_LINE)
 
-    # 10c. 行・列スライダーとラベル連携テスト
-    window.slider_cols.setValue(5)
-    assert window.lbl_cols_val.text() == "5", f"列ラベルが更新されていません: {window.lbl_cols_val.text()}"
-    assert window.sandbox_canvas.cols == 5, f"キャンバスの列数が更新されていません: {window.sandbox_canvas.cols}"
-    assert window.spin_cols.value() == 5, "互換プロパティ spin_cols が一致しません"
+    def tearDown(self):
+        self.canvas.close()
+        self.canvas.deleteLater()
 
-    window.slider_rows.setValue(3)
-    assert window.lbl_rows_val.text() == "3", f"行ラベルが更新されていません: {window.lbl_rows_val.text()}"
-    assert window.sandbox_canvas.rows == 3, f"キャンバスの行数が更新されていません: {window.sandbox_canvas.rows}"
-    assert window.spin_rows.value() == 3, "互換プロパティ spin_rows が一致しません"
-    print("   -> OK: 行・列スライダー & ラベル更新 & キャンバス連動 正常")
+    def test_edge_click_toggle_and_undo(self):
+        """辺のクリックで塗り・再クリックで消去され、Undo で段階的に戻ること。"""
+        a = self.canvas.vertex_to_widget_coords(0, 0)
+        b = self.canvas.vertex_to_widget_coords(1, 0)
+        mid = QPointF((a.x() + b.x()) / 2.0, (a.y() + b.y()) / 2.0)
+        key = ((0, 0), (1, 0))
 
-    print("\n=== [すべてのセルフチェックに合格しました] ===")
+        self.assertEqual(
+            self.canvas.find_nearest_edge(mid), key, "辺の当たり判定に失敗しました"
+        )
+
+        # 左クリックで塗り -> 同じ辺を再クリックで消去
+        QTest.mouseClick(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            mid.toPoint(),
+        )
+        self.assertIn(key, self.canvas.edges, "クリックで辺が塗られていません")
+
+        QTest.mouseClick(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            mid.toPoint(),
+        )
+        self.assertNotIn(
+            key, self.canvas.edges, "塗り済みの辺を再クリックしても消えません"
+        )
+
+        # Undo: 消去の取り消し -> 塗りの取り消し
+        self.canvas.undo()
+        self.assertIn(key, self.canvas.edges, "Undoで消去が復元されていません")
+        self.canvas.undo()
+        self.assertNotIn(key, self.canvas.edges, "Undoで塗りが取り消されていません")
+
+    def test_edge_drag_paint_and_erase(self):
+        """未塗りの辺からのドラッグで連続塗り、塗り済み辺からのドラッグで連続消去されること。"""
+        start = self.canvas.vertex_to_widget_coords(0, 0)
+        end = self.canvas.vertex_to_widget_coords(4, 0)
+
+        # 上辺 (0,0)->(4,0) を左から右へドラッグ塗り
+        QTest.mousePress(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            QPointF(start.x() + 5, start.y()).toPoint(),
+        )
+        for i in range(1, 41):
+            x = start.x() + 5 + (end.x() - start.x() - 10) * i / 40.0
+            QTest.mouseMove(self.canvas, QPointF(x, start.y()).toPoint())
+        QTest.mouseRelease(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            QPointF(end.x() - 5, end.y()).toPoint(),
+        )
+
+        top_edges = [((c, 0), (c + 1, 0)) for c in range(4)]
+        self.assertTrue(
+            all(e in self.canvas.edges for e in top_edges),
+            f"ドラッグで上辺4本が塗られていません: {list(self.canvas.edges)}",
+        )
+        self.assertEqual(
+            len(self.canvas.edges),
+            4,
+            f"余計な辺が塗られています: {list(self.canvas.edges)}",
+        )
+
+        # 塗り済みの辺から開始したドラッグで消去
+        QTest.mousePress(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            QPointF(start.x() + 5, start.y()).toPoint(),
+        )
+        for i in range(1, 41):
+            x = start.x() + 5 + (end.x() - start.x() - 10) * i / 40.0
+            QTest.mouseMove(self.canvas, QPointF(x, start.y()).toPoint())
+        QTest.mouseRelease(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            QPointF(end.x() - 5, end.y()).toPoint(),
+        )
+        self.assertEqual(
+            len(self.canvas.edges),
+            0,
+            f"ドラッグ消去できていません: {list(self.canvas.edges)}",
+        )
+
+    def test_eraser_removes_edge_stroke_and_cell_fill(self):
+        """消しゴム (erase_at_pos) で塗り辺・手書きストローク・セル塗りがそれぞれ消去できること。"""
+        a = self.canvas.vertex_to_widget_coords(0, 0)
+        b = self.canvas.vertex_to_widget_coords(1, 0)
+        mid = QPointF((a.x() + b.x()) / 2.0, (a.y() + b.y()) / 2.0)
+        key = ((0, 0), (1, 0))
+
+        self.canvas.apply_edge(key, "paint")
+        cell = (1, 1)
+        self.canvas.cell_fills[cell] = QColor(0, 200, 255)
+        self.canvas.freehand_strokes.append(
+            {
+                "points": [QPointF(100, 100), QPointF(120, 120)],
+                "color": QColor(255, 255, 255),
+                "width": 4,
+            }
+        )
+
+        self.assertTrue(self.canvas.erase_at_pos(mid))
+        self.assertNotIn(
+            key, self.canvas.edges, "消しゴムで塗り辺が消去されていません"
+        )
+
+        self.assertTrue(self.canvas.erase_at_pos(QPointF(110, 110)))
+        self.assertEqual(
+            len(self.canvas.freehand_strokes),
+            0,
+            "消しゴムで手書きストロークが消去されていません",
+        )
+
+        cell_wpt = self.canvas.vertex_to_widget_coords(1, 1)
+        cell_center = QPointF(cell_wpt.x() + 20, cell_wpt.y() + 20)
+        self.assertTrue(self.canvas.erase_at_pos(cell_center))
+        self.assertNotIn(
+            cell, self.canvas.cell_fills, "消しゴムでセル塗りが消去されていません"
+        )
+
+    def test_grid_adjust_corner_edge_and_move(self):
+        """枠調整モードで角リサイズ・辺リサイズ・全体移動が機能し、線が塗られないこと。"""
+        self.canvas.set_margin_percent(0.30)
+        self.canvas.set_draw_mode(DrawMode.GRID_ADJUST)
+        r0 = list(self.canvas.grid_rect)
+
+        # 左上の角を外側へドラッグ -> left/top のみ減少
+        tl = self.canvas.vertex_to_widget_coords(0, 0)
+        QTest.mousePress(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            tl.toPoint(),
+        )
+        QTest.mouseMove(self.canvas, QPointF(tl.x() - 60, tl.y() - 60).toPoint())
+        QTest.mouseRelease(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            QPointF(tl.x() - 60, tl.y() - 60).toPoint(),
+        )
+        r1 = list(self.canvas.grid_rect)
+        self.assertTrue(
+            r1[0] < r0[0] and r1[1] < r0[1],
+            f"角ドラッグで外枠が広がっていません: {r0} -> {r1}",
+        )
+        self.assertAlmostEqual(r1[2], r0[2], places=6, msg="右辺が動いてしまいました")
+        self.assertAlmostEqual(r1[3], r0[3], places=6, msg="下辺が動いてしまいました")
+
+        # 右辺の中点を外側へドラッグ -> right のみ増加
+        rp = self.canvas.grid_handle_positions()["r"]
+        QTest.mousePress(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            rp.toPoint(),
+        )
+        QTest.mouseMove(self.canvas, QPointF(rp.x() + 40, rp.y()).toPoint())
+        QTest.mouseRelease(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            QPointF(rp.x() + 40, rp.y()).toPoint(),
+        )
+        r2 = list(self.canvas.grid_rect)
+        self.assertGreater(r2[2], r1[2], f"右辺ドラッグが反映されていません: {r1} -> {r2}")
+        self.assertAlmostEqual(r2[0], r1[0], places=6)
+        self.assertAlmostEqual(r2[3], r1[3], places=6)
+
+        # 枠の内側をドラッグ -> サイズを保ったまま全体移動
+        c = self.canvas.vertex_to_widget_coords(2, 2)
+        w0, h0 = r2[2] - r2[0], r2[3] - r2[1]
+        QTest.mousePress(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            c.toPoint(),
+        )
+        QTest.mouseMove(self.canvas, QPointF(c.x() + 20, c.y() + 10).toPoint())
+        QTest.mouseRelease(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            QPointF(c.x() + 20, c.y() + 10).toPoint(),
+        )
+        r3 = list(self.canvas.grid_rect)
+        self.assertAlmostEqual(r3[2] - r3[0], w0, places=6, msg="全体移動で幅が変わりました")
+        self.assertAlmostEqual(r3[3] - r3[1], h0, places=6, msg="全体移動で高さが変わりました")
+        self.assertNotEqual(r3[0], r2[0], "全体移動できていません")
+        self.assertEqual(len(self.canvas.edges), 0, "枠調整中に辺が塗られています")
+
+    def test_single_direction_per_drag_operation(self):
+        """1回のドラッグ操作中は、交点から2方向へ同時に分岐して線が伸びないこと。"""
+        p11 = self.canvas.vertex_to_widget_coords(1, 1)
+        p21 = self.canvas.vertex_to_widget_coords(2, 1)
+        p22 = self.canvas.vertex_to_widget_coords(2, 2)
+        p31 = self.canvas.vertex_to_widget_coords(3, 1)
+        mid_11_21 = QPointF((p11.x() + p21.x()) / 2.0, (p11.y() + p21.y()) / 2.0)
+        mid_21_31 = QPointF((p21.x() + p31.x()) / 2.0, (p21.y() + p31.y()) / 2.0)
+
+        QTest.mousePress(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            mid_11_21.toPoint(),
+        )
+        self.assertIn(((1, 1), (2, 1)), self.canvas.edges)
+
+        for i in range(1, 11):
+            pt = QPointF(p21.x(), p21.y() + (p22.y() - p21.y()) * i / 10.0)
+            QTest.mouseMove(self.canvas, pt.toPoint())
+        self.assertIn(((2, 1), (2, 2)), self.canvas.edges)
+        self.assertEqual(len(self.canvas.edges), 2)
+
+        # マウスを離さずに別分岐 ((2,1)-(3,1)) に触れても塗られない
+        QTest.mouseMove(self.canvas, mid_21_31.toPoint())
+        self.assertNotIn(
+            ((2, 1), (3, 1)),
+            self.canvas.edges,
+            "1操作中に交点から2方向へ同時に伸びてしまっています",
+        )
+        QTest.mouseRelease(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            p22.toPoint(),
+        )
+
+    def test_third_branch_edge_in_separate_operation(self):
+        """別の操作（クリック）を行えば、既存の交点に3本目の線（T字路）を描画できること。"""
+        p11 = self.canvas.vertex_to_widget_coords(1, 1)
+        p21 = self.canvas.vertex_to_widget_coords(2, 1)
+        p22 = self.canvas.vertex_to_widget_coords(2, 2)
+        p31 = self.canvas.vertex_to_widget_coords(3, 1)
+        mid_11_21 = QPointF((p11.x() + p21.x()) / 2.0, (p11.y() + p21.y()) / 2.0)
+        mid_21_22 = QPointF((p21.x() + p22.x()) / 2.0, (p21.y() + p22.y()) / 2.0)
+        mid_21_31 = QPointF((p21.x() + p31.x()) / 2.0, (p21.y() + p31.y()) / 2.0)
+
+        # 交点 (2,1) に2本の辺を接続させる
+        QTest.mouseClick(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            mid_11_21.toPoint(),
+        )
+        QTest.mouseClick(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            mid_21_22.toPoint(),
+        )
+        self.assertEqual(len(self.canvas.edges), 2)
+
+        # 別操作で3本目 ((2,1), (3,1)) をクリック描画
+        QTest.mouseClick(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            mid_21_31.toPoint(),
+        )
+        self.assertIn(
+            ((2, 1), (3, 1)),
+            self.canvas.edges,
+            "同一交点への3本目の線が描画できませんでした",
+        )
+        self.assertEqual(len(self.canvas.edges), 3)
+
+
+# ==============================================================================
+# 4. MainWindow 統合・スライダー連動・画面キャプチャのテスト
+# ==============================================================================
+
+
+class TestMainWindowAndCapture(unittest.TestCase):
+    """MainWindow の画面遷移・UI連動・F4キャプチャ制御のテスト。"""
+
+    @classmethod
+    def setUpClass(cls):
+        get_qapp()
+
+    def setUp(self):
+        self._hotkey_patcher = mock.patch.object(MainWindow, "_register_global_hotkey")
+        self._hotkey_patcher.start()
+        self.addCleanup(self._hotkey_patcher.stop)
+        self.window = MainWindow()
+
+    def tearDown(self):
+        self.window.close()
+        self.window.deleteLater()
+
+    def test_main_window_detect_grid_and_execute_warp(self):
+        """四隅指定からマス目自動検知・正方形パース補正・サンドボックス遷移まで動作すること。"""
+        self.assertIsNotNone(self.window.captured_bgr)
+        self.assertEqual(self.window.stack.currentIndex(), 0)
+
+        self.window.perspective_canvas.points = [
+            QPointF(220, 110),
+            QPointF(780, 70),
+            QPointF(890, 580),
+            QPointF(150, 610),
+        ]
+        self.window._on_perspective_points_updated(
+            self.window.perspective_canvas.points
+        )
+        self.assertTrue(self.window.btn_warp.isEnabled())
+        self.assertTrue(self.window.btn_detect_grid.isEnabled())
+
+        # マス目検知の実行
+        self.window.action_detect_grid()
+        self.assertEqual(
+            (self.window.spin_cols.value(), self.window.spin_rows.value()),
+            (4, 4),
+            "マス目検知値が反映されていません",
+        )
+
+        # 透視投影変換の実行（デフォルト: 正方形 1:1）
+        self.window.action_execute_warp()
+        self.assertEqual(self.window.stack.currentIndex(), 1)
+        self.assertIsNotNone(self.window.warped_bgr)
+        h, w, _ = self.window.warped_bgr.shape
+        self.assertEqual(h, w, f"補正画像が正方形(1:1)になっていません: {w}x{h}")
+
+    def test_slider_and_compat_properties_sync(self):
+        """行・列スライダー変更で表示ラベル・キャンバス行列数・互換プロパティが連動すること。"""
+        self.window.slider_cols.setValue(5)
+        self.assertEqual(
+            self.window.lbl_cols_val.text(),
+            "5",
+            f"列ラベルが更新されていません: {self.window.lbl_cols_val.text()}",
+        )
+        self.assertEqual(
+            self.window.sandbox_canvas.cols,
+            5,
+            f"キャンバスの列数が更新されていません: {self.window.sandbox_canvas.cols}",
+        )
+        self.assertEqual(
+            self.window.spin_cols.value(), 5, "互換プロパティ spin_cols が一致しません"
+        )
+
+        self.window.slider_rows.setValue(3)
+        self.assertEqual(
+            self.window.lbl_rows_val.text(),
+            "3",
+            f"行ラベルが更新されていません: {self.window.lbl_rows_val.text()}",
+        )
+        self.assertEqual(
+            self.window.sandbox_canvas.rows,
+            3,
+            f"キャンバスの行数が更新されていません: {self.window.sandbox_canvas.rows}",
+        )
+        self.assertEqual(
+            self.window.spin_rows.value(), 3, "互換プロパティ spin_rows が一致しません"
+        )
+
+    def test_capture_foreground_window_and_fallback(self):
+        """前面ウィンドウ矩形でのキャプチャと、自ウィンドウ・矩形取得失敗時の全画面フォールバック。"""
+        grab_calls: list[tuple[int, int, int, int] | None] = []
+
+        def fake_grab(bbox=None, all_screens=False, **kw):
+            grab_calls.append(bbox)
+            w, h = (bbox[2] - bbox[0], bbox[3] - bbox[1]) if bbox else (1920, 1080)
+            return Image.new("RGB", (w, h), (10, 20, 30))
+
+        # 1. 前面ウィンドウの矩形が取得できる場合: bbox 指定で撮影
+        with (
+            mock.patch.object(main_mod.ImageGrab, "grab", side_effect=fake_grab),
+            mock.patch.object(
+                main_mod, "get_window_rect", return_value=(100, 50, 740, 530)
+            ),
+        ):
+            img = main_mod.capture_foreground_window_bgr(
+                target_hwnd=1234, exclude_hwnd=9999
+            )
+        self.assertEqual(
+            grab_calls[-1],
+            (100, 50, 740, 530),
+            f"前面ウィンドウ矩形で撮影されていません: {grab_calls[-1]}",
+        )
+        self.assertEqual(
+            img.shape, (480, 640, 3), f"撮影サイズが不正です: {img.shape}"
+        )
+
+        # 2. 対象が自アプリ自身の場合は全画面へフォールバック
+        with (
+            mock.patch.object(main_mod.ImageGrab, "grab", side_effect=fake_grab),
+            mock.patch.object(
+                main_mod, "get_window_rect", return_value=(100, 50, 740, 530)
+            ),
+        ):
+            main_mod.capture_foreground_window_bgr(
+                target_hwnd=9999, exclude_hwnd=9999
+            )
+        self.assertIsNone(
+            grab_calls[-1], "自アプリが対象のときは全画面フォールバックになるべきです"
+        )
+
+        # 3. ウィンドウ矩形が取得できない場合は全画面へフォールバック
+        with (
+            mock.patch.object(main_mod.ImageGrab, "grab", side_effect=fake_grab),
+            mock.patch.object(main_mod, "get_window_rect", return_value=None),
+        ):
+            main_mod.capture_foreground_window_bgr(
+                target_hwnd=1234, exclude_hwnd=9999
+            )
+        self.assertIsNone(
+            grab_calls[-1], "矩形取得失敗時は全画面フォールバックになるべきです"
+        )
+
+    def test_action_capture_screen_hides_and_restores_window(self):
+        """撮影実行中に自ウィンドウが一時非表示になり、撮影後に再表示・画像反映されること。"""
+        self.window.show()
+        state: dict[str, object] = {}
+
+        def fake_capture(target_hwnd=None, exclude_hwnd=None):
+            state["visible_during_capture"] = self.window.isVisible()
+            state["target"] = target_hwnd
+            return np.zeros((300, 400, 3), dtype=np.uint8)
+
+        with mock.patch.object(
+            main_mod, "capture_foreground_window_bgr", side_effect=fake_capture
+        ):
+            self.window.action_capture_screen()
+
+        self.assertIs(
+            state.get("visible_during_capture"),
+            False,
+            "撮影中に本アプリが表示されたままです (写り込みの原因)",
+        )
+        self.assertTrue(
+            self.window.isVisible(), "撮影後に本アプリが再表示されていません"
+        )
+        self.assertEqual(
+            self.window.captured_bgr.shape,
+            (300, 400, 3),
+            "キャプチャ画像が反映されていません",
+        )
+
 
 if __name__ == "__main__":
-    run_tests()
-
+    unittest.main(verbosity=2)
