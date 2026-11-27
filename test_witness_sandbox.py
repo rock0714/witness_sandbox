@@ -13,7 +13,6 @@ from unittest import mock
 # PyQt6 のインポート前にオフスクリーンモードを設定
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
-import cv2
 import numpy as np
 from PIL import Image
 from PyQt6.QtCore import QPointF, Qt
@@ -21,9 +20,11 @@ from PyQt6.QtGui import QColor
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication
 
-import witness_sandbox as main_mod
+import witness_sandbox
 from witness_sandbox import (
+    DARK_STYLE_QSS,
     DrawMode,
+    ImageCanvasBase,
     MainWindow,
     PerspectiveCanvas,
     SandboxCanvas,
@@ -238,6 +239,45 @@ class TestPerspectiveCanvas(unittest.TestCase):
             QPointF(150, 610),
         ]
         self.assertEqual(len(self.canvas.points), 4, "4点が保持されていません")
+
+    def test_common_image_canvas_base_inheritance_and_coords(self):
+        """両キャンバスが ImageCanvasBase を継承し、座標往復変換と空プレースホルダ描画が機能すること。"""
+        self.assertTrue(issubclass(PerspectiveCanvas, ImageCanvasBase))
+        self.assertTrue(issubclass(SandboxCanvas, ImageCanvasBase))
+
+        # 重複メソッドがサブクラス側で再定義されていないこと
+        for method_name in (
+            "get_display_scale_and_offset",
+            "widget_to_image_coords",
+            "image_to_widget_coords",
+        ):
+            self.assertNotIn(method_name, PerspectiveCanvas.__dict__)
+            self.assertNotIn(method_name, SandboxCanvas.__dict__)
+
+        # 空画像状態でのスケール計算およびプレースホルダ描画
+        self.assertEqual(self.canvas.get_display_scale_and_offset(), (1.0, 0.0, 0.0))
+        empty_grab = self.canvas.grab()
+        self.assertFalse(empty_grab.isNull())
+
+        empty_sb = SandboxCanvas()
+        empty_sb.resize(400, 300)
+        self.assertFalse(empty_sb.grab().isNull())
+        empty_sb.close()
+        empty_sb.deleteLater()
+
+        # 画像設定後の横長・縦長リサイズにおけるレターボックス計算と往復変換の一致
+        self.canvas.set_image(self.sample_img)  # 1000x700
+        for w, h in ((1000, 500), (500, 900)):
+            self.canvas.resize(w, h)
+            scale, ox, oy = self.canvas.get_display_scale_and_offset()
+            self.assertGreater(scale, 0.0)
+            self.assertTrue(ox > 0.0 or oy > 0.0)
+            orig_pt = QPointF(345.5, 210.25)
+            roundtrip = self.canvas.widget_to_image_coords(
+                self.canvas.image_to_widget_coords(orig_pt)
+            )
+            self.assertAlmostEqual(roundtrip.x(), orig_pt.x(), places=5)
+            self.assertAlmostEqual(roundtrip.y(), orig_pt.y(), places=5)
 
 
 # ==============================================================================
@@ -960,6 +1000,64 @@ class TestSandboxCanvas(unittest.TestCase):
         self.canvas.undo()
         np.testing.assert_allclose(self.canvas.grid_rect, r0, atol=1e-6)
 
+    def test_mode_move_handlers_reverse_end_and_adjust_cursors(self):
+        """モード別移動ハンドラで1辺目の逆側端点からの延長・巻き戻し、および枠調整カーソル更新が機能すること。"""
+        # 1. SNAP_LINE: 最初の1辺 ((1,1), (2,1)) をクリック後、左端 (1,1) 側から下方向 (1,2) へ伸ばす
+        p11 = self.canvas.vertex_to_widget_coords(1, 1)
+        p21 = self.canvas.vertex_to_widget_coords(2, 1)
+        p12 = self.canvas.vertex_to_widget_coords(1, 2)
+        mid_11_21 = QPointF((p11.x() + p21.x()) / 2.0, (p11.y() + p21.y()) / 2.0)
+
+        QTest.mousePress(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            mid_11_21.toPoint(),
+        )
+        for i in range(1, 16):
+            pt = QPointF(p11.x(), p11.y() + (p12.y() - p11.y()) * i / 15.0)
+            QTest.mouseMove(self.canvas, pt.toPoint())
+        self.assertIn(
+            ((1, 1), (1, 2)),
+            self.canvas.edges,
+            "最初の1辺の始点側頂点 (1,1) から隣接辺へ延長できていません",
+        )
+
+        # (1,1) へマウスを戻すと ((1,1), (1,2)) が巻き戻されること
+        for i in range(1, 16):
+            pt = QPointF(p12.x(), p12.y() + (p11.y() - p12.y()) * i / 15.0)
+            QTest.mouseMove(self.canvas, pt.toPoint())
+        QTest.mouseRelease(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            p11.toPoint(),
+        )
+        self.assertNotIn(((1, 1), (1, 2)), self.canvas.edges)
+        self.assertEqual(set(self.canvas.edges.keys()), {((1, 1), (2, 1))})
+
+        # 2. GRID_ADJUST: 非ドラッグ時のマウス移動で対象部位に応じたカーソル形状へ変化すること
+        self.canvas.set_margin_percent(0.20)
+        self.canvas.set_draw_mode(DrawMode.GRID_ADJUST)
+        handles = self.canvas.grid_handle_positions()
+        center_pt = self.canvas.vertex_to_widget_coords(2, 2)
+
+        expected_cursors = [
+            (handles["tl"], Qt.CursorShape.SizeFDiagCursor),
+            (handles["tr"], Qt.CursorShape.SizeBDiagCursor),
+            (handles["t"], Qt.CursorShape.SizeVerCursor),
+            (handles["l"], Qt.CursorShape.SizeHorCursor),
+            (center_pt, Qt.CursorShape.SizeAllCursor),
+            (QPointF(2.0, 2.0), Qt.CursorShape.ArrowCursor),
+        ]
+        for pt, expected_shape in expected_cursors:
+            QTest.mouseMove(self.canvas, pt.toPoint())
+            self.assertEqual(
+                self.canvas.cursor().shape(),
+                expected_shape,
+                f"座標 {pt} での枠調整カーソル形状が期待値と異なります",
+            )
+
 
 # ==============================================================================
 # 4. MainWindow 統合・スライダー連動・画面キャプチャのテスト
@@ -1003,7 +1101,7 @@ class TestMainWindowAndCapture(unittest.TestCase):
         # マス目検知の実行
         self.window.action_detect_grid()
         self.assertEqual(
-            (self.window.spin_cols.value(), self.window.spin_rows.value()),
+            (self.window.slider_cols.value(), self.window.slider_rows.value()),
             (4, 4),
             "マス目検知値が反映されていません",
         )
@@ -1015,8 +1113,12 @@ class TestMainWindowAndCapture(unittest.TestCase):
         h, w, _ = self.window.warped_bgr.shape
         self.assertEqual(h, w, f"補正画像が正方形(1:1)になっていません: {w}x{h}")
 
-    def test_slider_and_compat_properties_sync(self):
-        """行・列スライダー変更で表示ラベル・キャンバス行列数・互換プロパティが連動すること。"""
+    def test_grid_sliders_and_unlock_range_sync(self):
+        """行・列スライダー変更で表示ラベル・キャンバス行列数が連動し、制限解除で範囲が切り替わること。"""
+        self.assertEqual(
+            (self.window.slider_cols.minimum(), self.window.slider_cols.maximum()),
+            (3, 8),
+        )
         self.window.slider_cols.setValue(5)
         self.assertEqual(
             self.window.lbl_cols_val.text(),
@@ -1027,9 +1129,6 @@ class TestMainWindowAndCapture(unittest.TestCase):
             self.window.sandbox_canvas.cols,
             5,
             f"キャンバスの列数が更新されていません: {self.window.sandbox_canvas.cols}",
-        )
-        self.assertEqual(
-            self.window.spin_cols.value(), 5, "互換プロパティ spin_cols が一致しません"
         )
 
         self.window.slider_rows.setValue(3)
@@ -1043,9 +1142,73 @@ class TestMainWindowAndCapture(unittest.TestCase):
             3,
             f"キャンバスの行数が更新されていません: {self.window.sandbox_canvas.rows}",
         )
+
+        # 制限解除チェック ON で 1〜20、OFF で 3〜8 に切り替わること
+        self.window.chk_unlock_size.setChecked(True)
         self.assertEqual(
-            self.window.spin_rows.value(), 3, "互換プロパティ spin_rows が一致しません"
+            (self.window.slider_cols.minimum(), self.window.slider_cols.maximum()),
+            (1, 20),
         )
+        self.window.slider_cols.setValue(12)
+        self.assertEqual(self.window.sandbox_canvas.cols, 12)
+        self.window.chk_unlock_size.setChecked(False)
+        self.assertEqual(
+            (self.window.slider_cols.minimum(), self.window.slider_cols.maximum()),
+            (3, 8),
+        )
+
+    def test_apply_detected_grid_settings_unlocks_and_syncs(self):
+        """通常範囲外の検知結果に対して action_detect_grid と action_execute_warp の双方が制限解除・同期すること。"""
+        # 1. action_detect_grid で 2x2 (3未満) が返された場合
+        self.assertFalse(self.window.chk_unlock_size.isChecked())
+        with mock.patch.object(
+            witness_sandbox, "detect_grid_dimensions", return_value=(2, 2, 0.08)
+        ):
+            self.window.action_detect_grid()
+        self.assertTrue(self.window.chk_unlock_size.isChecked())
+        self.assertEqual(
+            (self.window.slider_cols.value(), self.window.slider_rows.value()), (2, 2)
+        )
+        self.assertEqual(
+            (self.window.sandbox_canvas.cols, self.window.sandbox_canvas.rows), (2, 2)
+        )
+        self.assertEqual(self.window.slider_margin.value(), 8)
+
+        # 一旦制限解除を戻し、2. action_execute_warp で 10x6 (8超) が返された場合
+        self.window.chk_unlock_size.setChecked(False)
+        with mock.patch.object(
+            witness_sandbox, "detect_grid_dimensions", return_value=(10, 6, 0.04)
+        ):
+            self.window.action_execute_warp()
+        self.assertTrue(self.window.chk_unlock_size.isChecked())
+        self.assertEqual(
+            (self.window.slider_cols.value(), self.window.slider_rows.value()), (10, 6)
+        )
+        self.assertEqual(
+            (self.window.lbl_cols_val.text(), self.window.lbl_rows_val.text()),
+            ("10", "6"),
+        )
+        self.assertEqual(
+            (self.window.sandbox_canvas.cols, self.window.sandbox_canvas.rows), (10, 6)
+        )
+        self.assertAlmostEqual(self.window.sandbox_canvas.margin_percent, 0.04, places=5)
+
+        # プリセット色・ダイアログ色の共通反映 (_apply_pen_color) とサンプル再読込時の画面初期化も確認
+        self.window.action_set_preset_color("#00FF66")
+        self.assertEqual(self.window.sandbox_canvas.current_color, QColor("#00FF66"))
+        self.assertIn("#00ff66", self.window.btn_color_indicator.styleSheet().lower())
+
+        with mock.patch.object(
+            witness_sandbox.QColorDialog, "getColor", return_value=QColor("#FF3366")
+        ):
+            self.window.action_choose_color()
+        self.assertEqual(self.window.sandbox_canvas.current_color, QColor("#FF3366"))
+        self.assertIn("#ff3366", self.window.btn_color_indicator.styleSheet().lower())
+
+        self.window.action_load_sample()
+        self.assertEqual(self.window.stack.currentIndex(), 0)
+        self.assertFalse(self.window.btn_goto_sandbox.isEnabled())
+        self.assertEqual(len(self.window.perspective_canvas.points), 4)
 
     def test_capture_foreground_window_and_fallback(self):
         """前面ウィンドウ矩形でのキャプチャと、自ウィンドウ・矩形取得失敗時の全画面フォールバック。"""
@@ -1058,12 +1221,12 @@ class TestMainWindowAndCapture(unittest.TestCase):
 
         # 1. 前面ウィンドウの矩形が取得できる場合: bbox 指定で撮影
         with (
-            mock.patch.object(main_mod.ImageGrab, "grab", side_effect=fake_grab),
+            mock.patch.object(witness_sandbox.ImageGrab, "grab", side_effect=fake_grab),
             mock.patch.object(
-                main_mod, "get_window_rect", return_value=(100, 50, 740, 530)
+                witness_sandbox, "get_window_rect", return_value=(100, 50, 740, 530)
             ),
         ):
-            img = main_mod.capture_foreground_window_bgr(
+            img = witness_sandbox.capture_foreground_window_bgr(
                 target_hwnd=1234, exclude_hwnd=9999
             )
         self.assertEqual(
@@ -1077,12 +1240,12 @@ class TestMainWindowAndCapture(unittest.TestCase):
 
         # 2. 対象が自アプリ自身の場合は全画面へフォールバック
         with (
-            mock.patch.object(main_mod.ImageGrab, "grab", side_effect=fake_grab),
+            mock.patch.object(witness_sandbox.ImageGrab, "grab", side_effect=fake_grab),
             mock.patch.object(
-                main_mod, "get_window_rect", return_value=(100, 50, 740, 530)
+                witness_sandbox, "get_window_rect", return_value=(100, 50, 740, 530)
             ),
         ):
-            main_mod.capture_foreground_window_bgr(
+            witness_sandbox.capture_foreground_window_bgr(
                 target_hwnd=9999, exclude_hwnd=9999
             )
         self.assertIsNone(
@@ -1091,10 +1254,10 @@ class TestMainWindowAndCapture(unittest.TestCase):
 
         # 3. ウィンドウ矩形が取得できない場合は全画面へフォールバック
         with (
-            mock.patch.object(main_mod.ImageGrab, "grab", side_effect=fake_grab),
-            mock.patch.object(main_mod, "get_window_rect", return_value=None),
+            mock.patch.object(witness_sandbox.ImageGrab, "grab", side_effect=fake_grab),
+            mock.patch.object(witness_sandbox, "get_window_rect", return_value=None),
         ):
-            main_mod.capture_foreground_window_bgr(
+            witness_sandbox.capture_foreground_window_bgr(
                 target_hwnd=1234, exclude_hwnd=9999
             )
         self.assertIsNone(
@@ -1112,7 +1275,7 @@ class TestMainWindowAndCapture(unittest.TestCase):
             return np.zeros((300, 400, 3), dtype=np.uint8)
 
         with mock.patch.object(
-            main_mod, "capture_foreground_window_bgr", side_effect=fake_capture
+            witness_sandbox, "capture_foreground_window_bgr", side_effect=fake_capture
         ):
             self.window.action_capture_screen()
 
@@ -1217,9 +1380,9 @@ class TestMainWindowAndCapture(unittest.TestCase):
         fake_full_shot = Image.new("RGB", (640, 360), (40, 80, 120))
 
         with (
-            mock.patch.object(main_mod, "ctypes", new=mock.MagicMock(spec=[])),
-            mock.patch.object(main_mod.ImageGrab, "grab", return_value=fake_full_shot) as mock_grab,
-            mock.patch.object(main_mod.QMessageBox, "critical") as mock_crit,
+            mock.patch.object(witness_sandbox, "ctypes", new=mock.MagicMock(spec=[])),
+            mock.patch.object(witness_sandbox.ImageGrab, "grab", return_value=fake_full_shot) as mock_grab,
+            mock.patch.object(witness_sandbox.QMessageBox, "critical") as mock_crit,
         ):
             self.window.action_capture_screen()
 
@@ -1260,7 +1423,7 @@ class TestMainWindowAndCapture(unittest.TestCase):
                 load_image_bgr(jp_path, max_file_bytes=10)
 
             # 6. 展開前解像度上限超過 (Image Bomb 対策: cv2.imdecode が呼ばれる前に拒否)
-            with mock.patch.object(main_mod.cv2, "imdecode") as mock_imdecode:
+            with mock.patch.object(witness_sandbox.cv2, "imdecode") as mock_imdecode:
                 with self.assertRaises(ValueError):
                     load_image_bgr(jp_path, max_side_px=50)
                 with self.assertRaises(ValueError):
@@ -1270,11 +1433,11 @@ class TestMainWindowAndCapture(unittest.TestCase):
             # 7. MainWindow.action_open_file での例外捕捉と警告ダイアログ表示
             with (
                 mock.patch.object(
-                    main_mod.QFileDialog,
+                    witness_sandbox.QFileDialog,
                     "getOpenFileName",
                     return_value=(empty_path, "画像ファイル (*.png)"),
                 ),
-                mock.patch.object(main_mod.QMessageBox, "warning") as mock_warn,
+                mock.patch.object(witness_sandbox.QMessageBox, "warning") as mock_warn,
             ):
                 self.window.action_open_file()
             mock_warn.assert_called_once()
@@ -1350,11 +1513,11 @@ class TestMainWindowAndCapture(unittest.TestCase):
             raw_save_base = os.path.join(tmpdir, "考察結果_出力")
             with (
                 mock.patch.object(
-                    main_mod.QFileDialog,
+                    witness_sandbox.QFileDialog,
                     "getSaveFileName",
                     return_value=(raw_save_base, "PNG画像 (*.png)"),
                 ),
-                mock.patch.object(main_mod.QMessageBox, "information") as mock_info,
+                mock.patch.object(witness_sandbox.QMessageBox, "information") as mock_info,
             ):
                 self.window.action_save_sandbox_image()
 
@@ -1395,9 +1558,9 @@ class TestMainWindowAndCapture(unittest.TestCase):
         self._hotkey_patcher.stop()
         try:
             # 非 Windows 環境 (wintypes=None または windll 不在) では例外なく False を返すこと
-            with mock.patch.object(main_mod, "wintypes", None):
+            with mock.patch.object(witness_sandbox, "wintypes", None):
                 self.assertFalse(self.window._register_global_hotkey())
-            with mock.patch.object(main_mod, "ctypes", new=mock.MagicMock(spec=[])):
+            with mock.patch.object(witness_sandbox, "ctypes", new=mock.MagicMock(spec=[])):
                 self.assertFalse(self.window._register_global_hotkey())
 
             fake_user32 = mock.MagicMock()
@@ -1407,26 +1570,26 @@ class TestMainWindowAndCapture(unittest.TestCase):
             fake_windll = mock.MagicMock()
             fake_windll.user32 = fake_user32
             effective_wintypes = (
-                main_mod.wintypes
-                if main_mod.wintypes is not None
+                witness_sandbox.wintypes
+                if witness_sandbox.wintypes is not None
                 else mock.MagicMock(HWND=lambda h: h)
             )
 
             # keyboard パッケージが存在しない環境でも動作することを強制確認
             with (
                 mock.patch.dict(sys.modules, {"keyboard": None}),
-                mock.patch.object(main_mod.ctypes, "windll", fake_windll, create=True),
-                mock.patch.object(main_mod, "wintypes", effective_wintypes),
+                mock.patch.object(witness_sandbox.ctypes, "windll", fake_windll, create=True),
+                mock.patch.object(witness_sandbox, "wintypes", effective_wintypes),
             ):
                 # 登録成功 (MOD_NOREPEAT)
                 self.assertTrue(self.window._register_global_hotkey())
                 self.assertIsNotNone(self.window._registered_hotkey_hwnd)
                 first_call_args = fake_user32.RegisterHotKey.call_args[0]
-                self.assertEqual(first_call_args[1], main_mod.HOTKEY_ID_F4)
+                self.assertEqual(first_call_args[1], witness_sandbox.HOTKEY_ID_F4)
                 self.assertEqual(
-                    first_call_args[2], main_mod.MOD_NONE | main_mod.MOD_NOREPEAT
+                    first_call_args[2], witness_sandbox.MOD_NONE | witness_sandbox.MOD_NOREPEAT
                 )
-                self.assertEqual(first_call_args[3], main_mod.VK_F4)
+                self.assertEqual(first_call_args[3], witness_sandbox.VK_F4)
 
                 # TopMost 切替時: いったん UnregisterHotKey され、MOD_NONE フォールバックで再登録される
                 self.window.action_toggle_topmost(True)
@@ -1449,7 +1612,7 @@ class TestMainWindowAndCapture(unittest.TestCase):
                 self.assertFalse(self.window._register_global_hotkey())
 
             # 2. nativeEvent で WM_HOTKEY (HOTKEY_ID_F4) を受信すると capture_requested が発火すること
-            if main_mod.wintypes is not None:
+            if witness_sandbox.wintypes is not None:
                 triggered: list[bool] = []
                 self.window.hotkey_signaler.capture_requested.disconnect()
                 self.window.hotkey_signaler.capture_requested.connect(
@@ -1457,24 +1620,24 @@ class TestMainWindowAndCapture(unittest.TestCase):
                 )
 
                 # 対象外のホットキー ID は無視されて基底へ委譲される
-                other_msg = main_mod.wintypes.MSG()
-                other_msg.message = main_mod.WM_HOTKEY
+                other_msg = witness_sandbox.wintypes.MSG()
+                other_msg.message = witness_sandbox.WM_HOTKEY
                 other_msg.wParam = 9999
                 handled, _ = self.window.nativeEvent(
                     QByteArray(b"windows_generic_MSG"),
-                    sip.voidptr(main_mod.ctypes.addressof(other_msg)),
+                    sip.voidptr(witness_sandbox.ctypes.addressof(other_msg)),
                 )
                 QApplication.processEvents()
                 self.assertFalse(handled)
                 self.assertEqual(len(triggered), 0)
 
                 # HOTKEY_ID_F4 の WM_HOTKEY で (True, 0) を返し capture_requested が発火する
-                f4_msg = main_mod.wintypes.MSG()
-                f4_msg.message = main_mod.WM_HOTKEY
-                f4_msg.wParam = main_mod.HOTKEY_ID_F4
+                f4_msg = witness_sandbox.wintypes.MSG()
+                f4_msg.message = witness_sandbox.WM_HOTKEY
+                f4_msg.wParam = witness_sandbox.HOTKEY_ID_F4
                 handled, result = self.window.nativeEvent(
                     QByteArray(b"windows_generic_MSG"),
-                    sip.voidptr(main_mod.ctypes.addressof(f4_msg)),
+                    sip.voidptr(witness_sandbox.ctypes.addressof(f4_msg)),
                 )
                 QApplication.processEvents()
                 self.assertTrue(handled)
@@ -1482,6 +1645,114 @@ class TestMainWindowAndCapture(unittest.TestCase):
                 self.assertEqual(len(triggered), 1, "WM_HOTKEY でキャプチャ要求が発火していません")
         finally:
             self._hotkey_patcher.start()
+
+
+# ==============================================================================
+# 5. コード衛生・旧名称削除・ドキュメント同期の回帰テスト
+# ==============================================================================
+
+
+class TestCodeHygieneAndDocsSync(unittest.TestCase):
+    """未使用インポート・デッドコード・旧名称の不在、およびドキュメント同期を検証するテスト。"""
+
+    def test_no_unused_imports_in_python_sources(self):
+        """リポジトリ内の実装・テスト Python ファイルに未使用の import が存在しないこと。"""
+        import ast
+        import pathlib
+
+        root = pathlib.Path(__file__).resolve().parent
+        py_files = [root / "witness_sandbox.py", root / "test_witness_sandbox.py"]
+
+        for py_path in py_files:
+            source = py_path.read_text("utf-8")
+            tree = ast.parse(source, filename=str(py_path))
+
+            # モジュールトップレベルの import シンボルを検査 (関数内ローカル import は対象外)
+            exported_all: set[str] = set()
+            for node in tree.body:
+                if isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name) and target.id == "__all__":
+                            if isinstance(node.value, (ast.List, ast.Tuple)):
+                                for elt in node.value.elts:
+                                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                                        exported_all.add(elt.value)
+
+            imported_names: dict[str, int] = {}
+            for node in tree.body:
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        bound = alias.asname or alias.name.split(".")[0]
+                        imported_names[bound] = node.lineno
+                elif isinstance(node, ast.ImportFrom):
+                    if node.module == "__future__":
+                        continue
+                    for alias in node.names:
+                        if alias.name == "*":
+                            continue
+                        bound = alias.asname or alias.name
+                        imported_names[bound] = node.lineno
+
+            used_names: set[str] = set(exported_all)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                    used_names.add(node.id)
+
+            unused = {
+                name: line
+                for name, line in imported_names.items()
+                if name not in used_names
+            }
+            self.assertEqual(
+                unused,
+                {},
+                f"{py_path.name} に未使用のインポートが残っています: {unused}",
+            )
+
+    def test_dead_code_and_legacy_identifiers_removed(self):
+        """削除対象のデッドコード・旧 SpinBox 名残・旧モジュール別名が残存していないこと。"""
+        import pathlib
+
+        self.assertFalse(hasattr(SandboxCanvas, "find_nearest_vertex"))
+        self.assertFalse(hasattr(MainWindow, "_on_grid_size_changed"))
+        self.assertFalse(hasattr(MainWindow, "spin_cols"))
+        self.assertFalse(hasattr(MainWindow, "spin_rows"))
+        self.assertNotIn("QSpinBox", DARK_STYLE_QSS)
+
+        test_src = pathlib.Path(__file__).resolve().read_text("utf-8")
+        legacy_alias = "main" + "_mod"
+        self.assertNotIn(legacy_alias, test_src, "テストコードに旧別名が残っています")
+
+    def test_readme_and_gitignore_synced_with_implementation(self):
+        """README.md と .gitignore の記述が現行 UI・プロジェクト構成と同期していること。"""
+        import pathlib
+
+        root = pathlib.Path(__file__).resolve().parent
+        readme = (root / "README.md").read_text("utf-8")
+        gitignore = (root / ".gitignore").read_text("utf-8")
+
+        # 全5種のツール名およびスライダー範囲仕様が README に記載されていること
+        for required_term in (
+            "線塗り",
+            "マス目塗り",
+            "自由手書き",
+            "消しゴム",
+            "枠調整",
+            "3〜8",
+            "制限解除",
+            "1〜20",
+        ):
+            self.assertIn(required_term, readme, f"README.md に '{required_term}' の記載がありません")
+
+        # 旧仕様・旧メディア表記が残っていないこと
+        self.assertNotIn("動画での利用例", readme)
+        self.assertNotIn("格子点の近くをクリック", readme)
+
+        # .gitignore から未存在ファイル・未追跡フォルダ指定が除去されていること
+        self.assertNotIn("test_warped.png", gitignore)
+        self.assertNotIn("!docs/*.png", gitignore)
+        self.assertIn("witness_sandbox_solution.png", gitignore)
+        self.assertIn("!assets/*.png", gitignore)
 
 
 if __name__ == "__main__":
