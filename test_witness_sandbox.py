@@ -562,6 +562,341 @@ class TestSandboxCanvas(unittest.TestCase):
         )
         self.assertEqual(len(self.canvas.edges), 3)
 
+    def test_clear_all_undo_restores_drawings_and_history(self):
+        """全消去 (clear_all) 後に Undo 1回で全描画が復元され、それ以前の履歴も保たれること。"""
+        # 空盤面での clear_all は無駄な Undo 履歴を積まない
+        self.canvas.clear_all()
+        self.assertEqual(len(self.canvas.undo_stack), 0)
+
+        # 1. 辺塗り
+        p00 = self.canvas.vertex_to_widget_coords(0, 0)
+        p10 = self.canvas.vertex_to_widget_coords(1, 0)
+        mid_edge = QPointF((p00.x() + p10.x()) / 2.0, (p00.y() + p10.y()) / 2.0)
+        QTest.mouseClick(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            mid_edge.toPoint(),
+        )
+        edge_key = ((0, 0), (1, 0))
+        self.assertIn(edge_key, self.canvas.edges)
+
+        # 2. マス目塗り
+        self.canvas.set_draw_mode(DrawMode.CELL_FILL)
+        p11 = self.canvas.vertex_to_widget_coords(1, 1)
+        p22 = self.canvas.vertex_to_widget_coords(2, 2)
+        cell_center = QPointF((p11.x() + p22.x()) / 2.0, (p11.y() + p22.y()) / 2.0)
+        QTest.mouseClick(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            cell_center.toPoint(),
+        )
+        self.assertIn((1, 1), self.canvas.cell_fills)
+
+        # 3. 自由手書き
+        self.canvas.set_draw_mode(DrawMode.FREEHAND)
+        QTest.mousePress(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            p11.toPoint(),
+        )
+        QTest.mouseMove(self.canvas, p22.toPoint())
+        QTest.mouseRelease(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            p22.toPoint(),
+        )
+        self.assertEqual(len(self.canvas.freehand_strokes), 1)
+
+        # 全消去を実行 -> すべて消える
+        self.canvas.clear_all()
+        self.assertEqual(len(self.canvas.edges), 0)
+        self.assertEqual(len(self.canvas.cell_fills), 0)
+        self.assertEqual(len(self.canvas.freehand_strokes), 0)
+
+        # Undo 1回で 辺・マス目塗り・自由手書きの3種すべてが一括復元される
+        self.canvas.undo()
+        self.assertIn(edge_key, self.canvas.edges, "全消去後のUndoで辺が復元されていません")
+        self.assertIn((1, 1), self.canvas.cell_fills, "全消去後のUndoでセル塗りが復元されていません")
+        self.assertEqual(
+            len(self.canvas.freehand_strokes), 1, "全消去後のUndoで自由手書きが復元されていません"
+        )
+
+        # さらに Undo を重ねると、全消去より前の個別操作（手書き -> セル塗り -> 辺）が順に取り消される
+        self.canvas.undo()
+        self.assertEqual(len(self.canvas.freehand_strokes), 0)
+        self.assertIn((1, 1), self.canvas.cell_fills)
+        self.canvas.undo()
+        self.assertNotIn((1, 1), self.canvas.cell_fills)
+        self.assertIn(edge_key, self.canvas.edges)
+        self.canvas.undo()
+        self.assertNotIn(edge_key, self.canvas.edges)
+
+    def test_drag_operations_undo_in_single_step(self):
+        """線塗り・線消去・セル塗り・消しゴムの連続ドラッグ操作がそれぞれ Undo 1回で戻ること。"""
+        start = self.canvas.vertex_to_widget_coords(0, 0)
+        end = self.canvas.vertex_to_widget_coords(4, 0)
+
+        # 1. 線塗り連続ドラッグ (4辺) -> Undo 1回で全消去
+        QTest.mousePress(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            QPointF(start.x() + 5, start.y()).toPoint(),
+        )
+        for i in range(1, 41):
+            x = start.x() + 5 + (end.x() - start.x() - 10) * i / 40.0
+            QTest.mouseMove(self.canvas, QPointF(x, start.y()).toPoint())
+        QTest.mouseRelease(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            QPointF(end.x() - 5, end.y()).toPoint(),
+        )
+        self.assertEqual(len(self.canvas.edges), 4)
+        self.canvas.undo()
+        self.assertEqual(
+            len(self.canvas.edges), 0, "連続ドラッグ塗りが Undo 1回で戻っていません"
+        )
+
+        # 2. 線消去連続ドラッグ (4辺) -> Undo 1回で4辺復元
+        for c in range(4):
+            self.canvas.apply_edge(((c, 0), (c + 1, 0)), "paint")
+        QTest.mousePress(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            QPointF(start.x() + 5, start.y()).toPoint(),
+        )
+        for i in range(1, 41):
+            x = start.x() + 5 + (end.x() - start.x() - 10) * i / 40.0
+            QTest.mouseMove(self.canvas, QPointF(x, start.y()).toPoint())
+        QTest.mouseRelease(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            QPointF(end.x() - 5, end.y()).toPoint(),
+        )
+        self.assertEqual(len(self.canvas.edges), 0)
+        self.canvas.undo()
+        self.assertEqual(
+            len(self.canvas.edges), 4, "連続ドラッグ消去が Undo 1回で復元されていません"
+        )
+
+        # 3. マス目塗り連続ドラッグ (余白から進入して3セル連続塗り) -> Undo 1回で3セル消去
+        self.canvas.set_draw_mode(DrawMode.CELL_FILL)
+        c0_tl = self.canvas.vertex_to_widget_coords(0, 1)
+        c0_br = self.canvas.vertex_to_widget_coords(1, 2)
+        c2_tl = self.canvas.vertex_to_widget_coords(2, 1)
+        c2_br = self.canvas.vertex_to_widget_coords(3, 2)
+        pt_margin_outside = QPointF(2.0, (c0_tl.y() + c0_br.y()) / 2.0)
+        pt_c2 = QPointF((c2_tl.x() + c2_br.x()) / 2.0, (c2_tl.y() + c2_br.y()) / 2.0)
+
+        QTest.mousePress(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            pt_margin_outside.toPoint(),
+        )
+        for i in range(1, 31):
+            x = pt_margin_outside.x() + (pt_c2.x() - pt_margin_outside.x()) * i / 30.0
+            QTest.mouseMove(
+                self.canvas,
+                QPointF(x, pt_c2.y()).toPoint(),
+            )
+        QTest.mouseRelease(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            pt_c2.toPoint(),
+        )
+        self.assertEqual(
+            set(self.canvas.cell_fills.keys()),
+            {(0, 1), (1, 1), (2, 1)},
+            f"余白からのドラッグ進入で3セルが塗られていません: {list(self.canvas.cell_fills)}",
+        )
+        self.canvas.undo()
+        self.assertEqual(
+            len(self.canvas.cell_fills), 0, "セル連続塗りが Undo 1回で戻っていません"
+        )
+
+        # 4. 消しゴム連続ドラッグ (mouseMoveEvent 経由で4辺を消去) -> Undo 1回で一括復元
+        self.canvas.set_draw_mode(DrawMode.ERASER)
+        QTest.mousePress(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            QPointF(start.x() + 5, start.y()).toPoint(),
+        )
+        for i in range(1, 41):
+            x = start.x() + 5 + (end.x() - start.x() - 10) * i / 40.0
+            QTest.mouseMove(self.canvas, QPointF(x, start.y()).toPoint())
+        QTest.mouseRelease(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            QPointF(end.x() - 5, end.y()).toPoint(),
+        )
+        self.assertEqual(len(self.canvas.edges), 0)
+        self.canvas.undo()
+        self.assertEqual(
+            len(self.canvas.edges), 4, "消しゴム連続ドラッグ消去が Undo 1回で復元されていません"
+        )
+
+    def test_drag_backtrack_does_not_resurrect_rewound_edge_on_undo(self):
+        """ドラッグ中に巻き戻して消した線が Undo 時に蘇らず、既存別色の上書き巻き戻しも復元されること。"""
+        p00 = self.canvas.vertex_to_widget_coords(0, 0)
+        p10 = self.canvas.vertex_to_widget_coords(1, 0)
+        p20 = self.canvas.vertex_to_widget_coords(2, 0)
+        p21 = self.canvas.vertex_to_widget_coords(2, 1)
+        mid_00_10 = QPointF((p00.x() + p10.x()) / 2.0, (p00.y() + p10.y()) / 2.0)
+
+        # あらかじめ ((2,0),(2,1)) にシアン色を塗っておく
+        cyan = QColor(0, 208, 255)
+        self.canvas.set_color(cyan)
+        self.canvas.apply_edge(((2, 0), (2, 1)), "paint")
+        self.canvas.set_color(QColor(255, 170, 0))  # オレンジに戻す
+
+        # (0,0)-(1,0) から (1,0)-(2,0)、さらに (2,0)-(2,1) までドラッグしてオレンジで上書き
+        QTest.mousePress(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            mid_00_10.toPoint(),
+        )
+        for i in range(1, 16):
+            pt = QPointF(p10.x() + (p20.x() - p10.x()) * i / 15.0, p10.y())
+            QTest.mouseMove(self.canvas, pt.toPoint())
+        for i in range(1, 16):
+            pt = QPointF(p20.x(), p20.y() + (p21.y() - p20.y()) * i / 15.0)
+            QTest.mouseMove(self.canvas, pt.toPoint())
+
+        self.assertEqual(
+            self.canvas.edges.get(((2, 0), (2, 1))),
+            QColor(255, 170, 0),
+            "3辺目までオレンジで伸びていません",
+        )
+
+        # マウスを頂点 (2,0) へ戻して ((2,0),(2,1)) を巻き戻し、リリースする
+        for i in range(1, 16):
+            pt = QPointF(p21.x(), p21.y() + (p20.y() - p21.y()) * i / 15.0)
+            QTest.mouseMove(self.canvas, pt.toPoint())
+        QTest.mouseRelease(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            p20.toPoint(),
+        )
+
+        # 巻き戻した ((2,0),(2,1)) は元のシアン色に戻り、新規の2辺のみオレンジで残る
+        self.assertEqual(self.canvas.edges.get(((2, 0), (2, 1))), cyan)
+        self.assertIn(((0, 0), (1, 0)), self.canvas.edges)
+        self.assertIn(((1, 0), (2, 0)), self.canvas.edges)
+        self.assertEqual(len(self.canvas.edges), 3)
+
+        # 空盤面からの通常巻き戻しも検証するため Undo でドラッグ前の状態 (シアン1辺のみ) へ1回で戻ることを確認
+        self.canvas.undo()
+        self.assertEqual(
+            set(self.canvas.edges.keys()),
+            {((2, 0), (2, 1))},
+            "Undo 1回でドラッグ開始前の辺集合に戻っていません",
+        )
+        self.assertEqual(self.canvas.edges[((2, 0), (2, 1))], cyan)
+
+        # シアン辺も Undo して完全に空にしてから、未塗り辺の巻き戻しで蘇らないことを確認
+        self.canvas.undo()
+        self.assertEqual(len(self.canvas.edges), 0)
+
+        QTest.mousePress(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            mid_00_10.toPoint(),
+        )
+        for i in range(1, 16):
+            pt = QPointF(p10.x() + (p20.x() - p10.x()) * i / 15.0, p10.y())
+            QTest.mouseMove(self.canvas, pt.toPoint())
+        for i in range(1, 16):
+            pt = QPointF(p20.x(), p20.y() + (p21.y() - p20.y()) * i / 15.0)
+            QTest.mouseMove(self.canvas, pt.toPoint())
+        self.assertIn(((2, 0), (2, 1)), self.canvas.edges)
+
+        # 頂点 (2,0) へ巻き戻して消去しリリース
+        for i in range(1, 16):
+            pt = QPointF(p21.x(), p21.y() + (p20.y() - p21.y()) * i / 15.0)
+            QTest.mouseMove(self.canvas, pt.toPoint())
+        QTest.mouseRelease(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            p20.toPoint(),
+        )
+        self.assertNotIn(((2, 0), (2, 1)), self.canvas.edges)
+        self.assertEqual(len(self.canvas.edges), 2)
+
+        # Undo 1回で残り2辺が一括消去され、巻き戻した ((2,0),(2,1)) が蘇らないこと
+        self.canvas.undo()
+        self.assertEqual(
+            len(self.canvas.edges),
+            0,
+            f"Undo 後に巻き戻した辺や残骸が残っています: {list(self.canvas.edges)}",
+        )
+        self.canvas.undo()
+        self.assertEqual(len(self.canvas.edges), 0)
+
+    def test_grid_adjust_undo_restores_grid_rect(self):
+        """枠調整 (GRID_ADJUST) のドラッグ変更が1操作ごとに Undo で元の枠へ戻ること。"""
+        self.canvas.set_margin_percent(0.25)
+        self.canvas.set_draw_mode(DrawMode.GRID_ADJUST)
+        r0 = list(self.canvas.grid_rect)
+
+        # 1操作目: 左上角ドラッグ
+        tl = self.canvas.vertex_to_widget_coords(0, 0)
+        QTest.mousePress(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            tl.toPoint(),
+        )
+        QTest.mouseMove(self.canvas, QPointF(tl.x() - 50, tl.y() - 40).toPoint())
+        QTest.mouseRelease(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            QPointF(tl.x() - 50, tl.y() - 40).toPoint(),
+        )
+        r1 = list(self.canvas.grid_rect)
+        self.assertNotEqual(r1, r0)
+
+        # 2操作目: 内側ドラッグ全体移動
+        c = self.canvas.vertex_to_widget_coords(2, 2)
+        QTest.mousePress(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            c.toPoint(),
+        )
+        QTest.mouseMove(self.canvas, QPointF(c.x() + 25, c.y() + 15).toPoint())
+        QTest.mouseRelease(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            QPointF(c.x() + 25, c.y() + 15).toPoint(),
+        )
+        r2 = list(self.canvas.grid_rect)
+        self.assertNotEqual(r2, r1)
+
+        # Undo 1回目 -> r1 に戻る
+        self.canvas.undo()
+        np.testing.assert_allclose(self.canvas.grid_rect, r1, atol=1e-6)
+
+        # Undo 2回目 -> r0 に戻る
+        self.canvas.undo()
+        np.testing.assert_allclose(self.canvas.grid_rect, r0, atol=1e-6)
+
 
 # ==============================================================================
 # 4. MainWindow 統合・スライダー連動・画面キャプチャのテスト
@@ -730,6 +1065,87 @@ class TestMainWindowAndCapture(unittest.TestCase):
             self.window.captured_bgr.shape,
             (300, 400, 3),
             "キャプチャ画像が反映されていません",
+        )
+
+    def test_clear_button_and_margin_slider_undo_after_grid_adjust(self):
+        """MainWindow の全消去ボタンおよび枠調整後のマージンスライダー変更が Undo で復元できること。"""
+        self.window.show()
+        self.window.resize(900, 700)
+        self.window.action_execute_warp()
+        canvas = self.window.sandbox_canvas
+        self.assertEqual(len(canvas.undo_stack), 0, "ワープ直後の履歴は空であるべきです")
+
+        # 1. 枠調整で非対称な外枠を設定
+        canvas.set_draw_mode(DrawMode.GRID_ADJUST)
+        tl = canvas.vertex_to_widget_coords(0, 0)
+        QTest.mousePress(
+            canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            tl.toPoint(),
+        )
+        QTest.mouseMove(canvas, QPointF(tl.x() + 30, tl.y() + 15).toPoint())
+        QTest.mouseRelease(
+            canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            QPointF(tl.x() + 30, tl.y() + 15).toPoint(),
+        )
+        custom_rect = list(canvas.grid_rect)
+        cl, ct, cr, cb = custom_rect
+        expected_avg = int(round(((cl + ct + (1.0 - cr) + (1.0 - cb)) / 4.0) * 100))
+        self.assertEqual(
+            self.window.slider_margin.value(),
+            expected_avg,
+            "枠調整後の4辺平均マージンがスライダー表示に同期されていません",
+        )
+
+        # 2a. マージンスライダーをドラッグ操作した後に離す -> 均等マージンへ変化するが1操作として Undo 可能
+        self.window.slider_margin.sliderPressed.emit()
+        self.window.slider_margin.setValue(18)
+        self.window.slider_margin.setValue(22)
+        self.window.slider_margin.sliderReleased.emit()
+        np.testing.assert_allclose(canvas.grid_rect, [0.22, 0.22, 0.78, 0.78], atol=1e-6)
+
+        # 2b. ドラッグを伴わない単発スライダー変更 (クリックジャンプ・キー操作相当)
+        self.window.slider_margin.setValue(26)
+        np.testing.assert_allclose(canvas.grid_rect, [0.26, 0.26, 0.74, 0.74], atol=1e-6)
+
+        # Undo 1回目 -> 単発変更前の 22% に戻りスライダー表示も 22 に同期
+        canvas.undo()
+        np.testing.assert_allclose(canvas.grid_rect, [0.22, 0.22, 0.78, 0.78], atol=1e-6)
+        self.assertEqual(self.window.slider_margin.value(), 22)
+
+        # Undo 2回目 -> スライダー操作前の個別枠調整状態 custom_rect と平均スライダー表示に完全復元
+        canvas.undo()
+        np.testing.assert_allclose(
+            canvas.grid_rect,
+            custom_rect,
+            atol=1e-6,
+            err_msg="マージンスライダー操作後の Undo で個別枠調整が復元されていません",
+        )
+        self.assertEqual(self.window.slider_margin.value(), expected_avg)
+
+        # 3. 辺を描画して MainWindow の「全消去」ボタンをクリック -> Undo で復元される
+        canvas.set_draw_mode(DrawMode.SNAP_LINE)
+        p00 = canvas.vertex_to_widget_coords(0, 0)
+        p10 = canvas.vertex_to_widget_coords(1, 0)
+        mid = QPointF((p00.x() + p10.x()) / 2.0, (p00.y() + p10.y()) / 2.0)
+        QTest.mouseClick(
+            canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            mid.toPoint(),
+        )
+        self.assertIn(((0, 0), (1, 0)), canvas.edges)
+
+        self.window.btn_clear.click()
+        self.assertEqual(len(canvas.edges), 0)
+        canvas.undo()
+        self.assertIn(
+            ((0, 0), (1, 0)),
+            canvas.edges,
+            "全消去ボタンクリック後に Undo で辺が復元されていません",
         )
 
 
