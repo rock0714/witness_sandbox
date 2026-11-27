@@ -21,15 +21,16 @@ from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication
 
 import witness_sandbox
-from witness_sandbox import (
-    DARK_STYLE_QSS,
+from app import canvas, capture, vision, window
+from app.canvas import (
     DrawMode,
     ImageCanvasBase,
-    MainWindow,
     PerspectiveCanvas,
     SandboxCanvas,
-    create_sample_witness_image,
     cv_to_qpixmap,
+)
+from app.vision import (
+    create_sample_witness_image,
     detect_grid_dimensions,
     load_image_bgr,
     normalize_save_image_path,
@@ -38,6 +39,7 @@ from witness_sandbox import (
     validate_quad_points,
     warp_perspective,
 )
+from app.window import DARK_STYLE_QSS, MainWindow
 
 # プロセス内で単一の QApplication インスタンスを保持
 _QAPP: QApplication | None = None
@@ -1162,7 +1164,7 @@ class TestMainWindowAndCapture(unittest.TestCase):
         # 1. action_detect_grid で 2x2 (3未満) が返された場合
         self.assertFalse(self.window.chk_unlock_size.isChecked())
         with mock.patch.object(
-            witness_sandbox, "detect_grid_dimensions", return_value=(2, 2, 0.08)
+            vision, "detect_grid_dimensions", return_value=(2, 2, 0.08)
         ):
             self.window.action_detect_grid()
         self.assertTrue(self.window.chk_unlock_size.isChecked())
@@ -1177,7 +1179,7 @@ class TestMainWindowAndCapture(unittest.TestCase):
         # 一旦制限解除を戻し、2. action_execute_warp で 10x6 (8超) が返された場合
         self.window.chk_unlock_size.setChecked(False)
         with mock.patch.object(
-            witness_sandbox, "detect_grid_dimensions", return_value=(10, 6, 0.04)
+            vision, "detect_grid_dimensions", return_value=(10, 6, 0.04)
         ):
             self.window.action_execute_warp()
         self.assertTrue(self.window.chk_unlock_size.isChecked())
@@ -1199,7 +1201,7 @@ class TestMainWindowAndCapture(unittest.TestCase):
         self.assertIn("#00ff66", self.window.btn_color_indicator.styleSheet().lower())
 
         with mock.patch.object(
-            witness_sandbox.QColorDialog, "getColor", return_value=QColor("#FF3366")
+            window.QColorDialog, "getColor", return_value=QColor("#FF3366")
         ):
             self.window.action_choose_color()
         self.assertEqual(self.window.sandbox_canvas.current_color, QColor("#FF3366"))
@@ -1221,12 +1223,12 @@ class TestMainWindowAndCapture(unittest.TestCase):
 
         # 1. 前面ウィンドウの矩形が取得できる場合: bbox 指定で撮影
         with (
-            mock.patch.object(witness_sandbox.ImageGrab, "grab", side_effect=fake_grab),
+            mock.patch.object(capture.ImageGrab, "grab", side_effect=fake_grab),
             mock.patch.object(
-                witness_sandbox, "get_window_rect", return_value=(100, 50, 740, 530)
+                capture, "get_window_rect", return_value=(100, 50, 740, 530)
             ),
         ):
-            img = witness_sandbox.capture_foreground_window_bgr(
+            img = capture.capture_foreground_window_bgr(
                 target_hwnd=1234, exclude_hwnd=9999
             )
         self.assertEqual(
@@ -1240,12 +1242,12 @@ class TestMainWindowAndCapture(unittest.TestCase):
 
         # 2. 対象が自アプリ自身の場合は全画面へフォールバック
         with (
-            mock.patch.object(witness_sandbox.ImageGrab, "grab", side_effect=fake_grab),
+            mock.patch.object(capture.ImageGrab, "grab", side_effect=fake_grab),
             mock.patch.object(
-                witness_sandbox, "get_window_rect", return_value=(100, 50, 740, 530)
+                capture, "get_window_rect", return_value=(100, 50, 740, 530)
             ),
         ):
-            witness_sandbox.capture_foreground_window_bgr(
+            capture.capture_foreground_window_bgr(
                 target_hwnd=9999, exclude_hwnd=9999
             )
         self.assertIsNone(
@@ -1254,10 +1256,10 @@ class TestMainWindowAndCapture(unittest.TestCase):
 
         # 3. ウィンドウ矩形が取得できない場合は全画面へフォールバック
         with (
-            mock.patch.object(witness_sandbox.ImageGrab, "grab", side_effect=fake_grab),
-            mock.patch.object(witness_sandbox, "get_window_rect", return_value=None),
+            mock.patch.object(capture.ImageGrab, "grab", side_effect=fake_grab),
+            mock.patch.object(capture, "get_window_rect", return_value=None),
         ):
-            witness_sandbox.capture_foreground_window_bgr(
+            capture.capture_foreground_window_bgr(
                 target_hwnd=1234, exclude_hwnd=9999
             )
         self.assertIsNone(
@@ -1275,7 +1277,7 @@ class TestMainWindowAndCapture(unittest.TestCase):
             return np.zeros((300, 400, 3), dtype=np.uint8)
 
         with mock.patch.object(
-            witness_sandbox, "capture_foreground_window_bgr", side_effect=fake_capture
+            capture, "capture_foreground_window_bgr", side_effect=fake_capture
         ):
             self.window.action_capture_screen()
 
@@ -1380,9 +1382,9 @@ class TestMainWindowAndCapture(unittest.TestCase):
         fake_full_shot = Image.new("RGB", (640, 360), (40, 80, 120))
 
         with (
-            mock.patch.object(witness_sandbox, "ctypes", new=mock.MagicMock(spec=[])),
-            mock.patch.object(witness_sandbox.ImageGrab, "grab", return_value=fake_full_shot) as mock_grab,
-            mock.patch.object(witness_sandbox.QMessageBox, "critical") as mock_crit,
+            mock.patch.object(capture, "ctypes", new=mock.MagicMock(spec=[])),
+            mock.patch.object(capture.ImageGrab, "grab", return_value=fake_full_shot) as mock_grab,
+            mock.patch.object(window.QMessageBox, "critical") as mock_crit,
         ):
             self.window.action_capture_screen()
 
@@ -1423,7 +1425,7 @@ class TestMainWindowAndCapture(unittest.TestCase):
                 load_image_bgr(jp_path, max_file_bytes=10)
 
             # 6. 展開前解像度上限超過 (Image Bomb 対策: cv2.imdecode が呼ばれる前に拒否)
-            with mock.patch.object(witness_sandbox.cv2, "imdecode") as mock_imdecode:
+            with mock.patch.object(vision.cv2, "imdecode") as mock_imdecode:
                 with self.assertRaises(ValueError):
                     load_image_bgr(jp_path, max_side_px=50)
                 with self.assertRaises(ValueError):
@@ -1433,11 +1435,11 @@ class TestMainWindowAndCapture(unittest.TestCase):
             # 7. MainWindow.action_open_file での例外捕捉と警告ダイアログ表示
             with (
                 mock.patch.object(
-                    witness_sandbox.QFileDialog,
+                    window.QFileDialog,
                     "getOpenFileName",
                     return_value=(empty_path, "画像ファイル (*.png)"),
                 ),
-                mock.patch.object(witness_sandbox.QMessageBox, "warning") as mock_warn,
+                mock.patch.object(window.QMessageBox, "warning") as mock_warn,
             ):
                 self.window.action_open_file()
             mock_warn.assert_called_once()
@@ -1513,11 +1515,11 @@ class TestMainWindowAndCapture(unittest.TestCase):
             raw_save_base = os.path.join(tmpdir, "考察結果_出力")
             with (
                 mock.patch.object(
-                    witness_sandbox.QFileDialog,
+                    window.QFileDialog,
                     "getSaveFileName",
                     return_value=(raw_save_base, "PNG画像 (*.png)"),
                 ),
-                mock.patch.object(witness_sandbox.QMessageBox, "information") as mock_info,
+                mock.patch.object(window.QMessageBox, "information") as mock_info,
             ):
                 self.window.action_save_sandbox_image()
 
@@ -1558,9 +1560,9 @@ class TestMainWindowAndCapture(unittest.TestCase):
         self._hotkey_patcher.stop()
         try:
             # 非 Windows 環境 (wintypes=None または windll 不在) では例外なく False を返すこと
-            with mock.patch.object(witness_sandbox, "wintypes", None):
+            with mock.patch.object(capture, "wintypes", None):
                 self.assertFalse(self.window._register_global_hotkey())
-            with mock.patch.object(witness_sandbox, "ctypes", new=mock.MagicMock(spec=[])):
+            with mock.patch.object(capture, "ctypes", new=mock.MagicMock(spec=[])):
                 self.assertFalse(self.window._register_global_hotkey())
 
             fake_user32 = mock.MagicMock()
@@ -1570,26 +1572,26 @@ class TestMainWindowAndCapture(unittest.TestCase):
             fake_windll = mock.MagicMock()
             fake_windll.user32 = fake_user32
             effective_wintypes = (
-                witness_sandbox.wintypes
-                if witness_sandbox.wintypes is not None
+                capture.wintypes
+                if capture.wintypes is not None
                 else mock.MagicMock(HWND=lambda h: h)
             )
 
             # keyboard パッケージが存在しない環境でも動作することを強制確認
             with (
                 mock.patch.dict(sys.modules, {"keyboard": None}),
-                mock.patch.object(witness_sandbox.ctypes, "windll", fake_windll, create=True),
-                mock.patch.object(witness_sandbox, "wintypes", effective_wintypes),
+                mock.patch.object(capture.ctypes, "windll", fake_windll, create=True),
+                mock.patch.object(capture, "wintypes", effective_wintypes),
             ):
                 # 登録成功 (MOD_NOREPEAT)
                 self.assertTrue(self.window._register_global_hotkey())
                 self.assertIsNotNone(self.window._registered_hotkey_hwnd)
                 first_call_args = fake_user32.RegisterHotKey.call_args[0]
-                self.assertEqual(first_call_args[1], witness_sandbox.HOTKEY_ID_F4)
+                self.assertEqual(first_call_args[1], capture.HOTKEY_ID_F4)
                 self.assertEqual(
-                    first_call_args[2], witness_sandbox.MOD_NONE | witness_sandbox.MOD_NOREPEAT
+                    first_call_args[2], capture.MOD_NONE | capture.MOD_NOREPEAT
                 )
-                self.assertEqual(first_call_args[3], witness_sandbox.VK_F4)
+                self.assertEqual(first_call_args[3], capture.VK_F4)
 
                 # TopMost 切替時: いったん UnregisterHotKey され、MOD_NONE フォールバックで再登録される
                 self.window.action_toggle_topmost(True)
@@ -1611,8 +1613,21 @@ class TestMainWindowAndCapture(unittest.TestCase):
                 self.assertFalse(self.window._hotkey_init_timer.isActive())
                 self.assertFalse(self.window._register_global_hotkey())
 
+                # activate_window_native: hwnd=0 は no-op、有効 hwnd は ShowWindow/SetForegroundWindow を呼び例外も吸収
+                capture.activate_window_native(0)
+                fake_user32.ShowWindow.assert_not_called()
+                capture.activate_window_native(4321)
+                fake_user32.ShowWindow.assert_called_once_with(4321, 1)
+                fake_user32.SetForegroundWindow.assert_called_once_with(4321)
+                fake_user32.SetForegroundWindow.side_effect = RuntimeError("denied")
+                capture.activate_window_native(4321)  # 例外が外部へ漏れないこと
+
+            # 非 Windows 環境での activate_window_native も安全に no-op となること
+            with mock.patch.object(capture, "ctypes", new=mock.MagicMock(spec=[])):
+                capture.activate_window_native(4321)
+
             # 2. nativeEvent で WM_HOTKEY (HOTKEY_ID_F4) を受信すると capture_requested が発火すること
-            if witness_sandbox.wintypes is not None:
+            if capture.wintypes is not None:
                 triggered: list[bool] = []
                 self.window.hotkey_signaler.capture_requested.disconnect()
                 self.window.hotkey_signaler.capture_requested.connect(
@@ -1620,24 +1635,24 @@ class TestMainWindowAndCapture(unittest.TestCase):
                 )
 
                 # 対象外のホットキー ID は無視されて基底へ委譲される
-                other_msg = witness_sandbox.wintypes.MSG()
-                other_msg.message = witness_sandbox.WM_HOTKEY
+                other_msg = capture.wintypes.MSG()
+                other_msg.message = capture.WM_HOTKEY
                 other_msg.wParam = 9999
                 handled, _ = self.window.nativeEvent(
                     QByteArray(b"windows_generic_MSG"),
-                    sip.voidptr(witness_sandbox.ctypes.addressof(other_msg)),
+                    sip.voidptr(capture.ctypes.addressof(other_msg)),
                 )
                 QApplication.processEvents()
                 self.assertFalse(handled)
                 self.assertEqual(len(triggered), 0)
 
                 # HOTKEY_ID_F4 の WM_HOTKEY で (True, 0) を返し capture_requested が発火する
-                f4_msg = witness_sandbox.wintypes.MSG()
-                f4_msg.message = witness_sandbox.WM_HOTKEY
-                f4_msg.wParam = witness_sandbox.HOTKEY_ID_F4
+                f4_msg = capture.wintypes.MSG()
+                f4_msg.message = capture.WM_HOTKEY
+                f4_msg.wParam = capture.HOTKEY_ID_F4
                 handled, result = self.window.nativeEvent(
                     QByteArray(b"windows_generic_MSG"),
-                    sip.voidptr(witness_sandbox.ctypes.addressof(f4_msg)),
+                    sip.voidptr(capture.ctypes.addressof(f4_msg)),
                 )
                 QApplication.processEvents()
                 self.assertTrue(handled)
@@ -1648,28 +1663,113 @@ class TestMainWindowAndCapture(unittest.TestCase):
 
 
 # ==============================================================================
-# 5. コード衛生・旧名称削除・ドキュメント同期の回帰テスト
+# 5. モジュール分割アーキテクチャ・コード衛生・ドキュメント同期の回帰テスト
 # ==============================================================================
 
 
 class TestCodeHygieneAndDocsSync(unittest.TestCase):
-    """未使用インポート・デッドコード・旧名称の不在、およびドキュメント同期を検証するテスト。"""
+    """モジュール責務分離・未使用インポート不在・旧名称削除・ドキュメント同期を検証するテスト。"""
+
+    def test_module_decoupling_and_entrypoint_reexports(self):
+        """vision / capture が PyQt6 非依存に分離され、witness_sandbox からの再エクスポートが一致すること。"""
+        import ast
+        import pathlib
+        import subprocess
+
+        root = pathlib.Path(__file__).resolve().parent
+        expected_modules = ("__init__.py", "vision.py", "capture.py", "canvas.py", "window.py")
+        for mod_file in expected_modules:
+            self.assertTrue(
+                (root / "app" / mod_file).is_file(),
+                f"app/{mod_file} が存在しません",
+            )
+
+        # 1. 別プロセスで app.vision と app.capture のみを import した際、PyQt6 が一切ロードされないこと
+        check_code = (
+            "import sys; import app.vision, app.capture; "
+            "qt_mods = [m for m in sys.modules if m.startswith('PyQt6')]; "
+            "assert not qt_mods, f'PyQt6 leaked into vision/capture: {qt_mods}'"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", check_code],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(
+            proc.returncode,
+            0,
+            f"vision/capture の PyQt6 疎結合検証に失敗しました: {proc.stderr}",
+        )
+
+        # 2. window.py が ctypes / cv2 に直接依存せず capture / vision / canvas に委譲していること
+        window_tree = ast.parse((root / "app" / "window.py").read_text("utf-8"))
+        window_imports = {
+            alias.name
+            for node in ast.walk(window_tree)
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        } | {
+            node.module or ""
+            for node in ast.walk(window_tree)
+            if isinstance(node, ast.ImportFrom)
+        }
+        self.assertNotIn("ctypes", window_imports)
+        self.assertNotIn("cv2", window_imports)
+
+        # 3. witness_sandbox.py がエントリポイントに徹し、主要クラス・関数を同一実体で再エクスポートしていること
+        entry_tree = ast.parse((root / "witness_sandbox.py").read_text("utf-8"))
+        top_defs = [
+            node.name
+            for node in entry_tree.body
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef))
+        ]
+        self.assertEqual(
+            top_defs,
+            [],
+            f"witness_sandbox.py に重複定義が残っています: {top_defs}",
+        )
+
+        self.assertIs(witness_sandbox.MainWindow, window.MainWindow)
+        self.assertIs(witness_sandbox.main, window.main)
+        self.assertIs(witness_sandbox.ImageCanvasBase, canvas.ImageCanvasBase)
+        self.assertIs(witness_sandbox.PerspectiveCanvas, canvas.PerspectiveCanvas)
+        self.assertIs(witness_sandbox.SandboxCanvas, canvas.SandboxCanvas)
+        self.assertIs(witness_sandbox.order_points, vision.order_points)
+        self.assertIs(
+            witness_sandbox.capture_foreground_window_bgr,
+            capture.capture_foreground_window_bgr,
+        )
+        for exported_name in witness_sandbox.__all__:
+            self.assertTrue(
+                hasattr(witness_sandbox, exported_name),
+                f"__all__ の '{exported_name}' が witness_sandbox に存在しません",
+            )
 
     def test_no_unused_imports_in_python_sources(self):
-        """リポジトリ内の実装・テスト Python ファイルに未使用の import が存在しないこと。"""
+        """リポジトリ内の全実装・テスト Python ファイルに未使用の import が存在しないこと。"""
         import ast
         import pathlib
 
         root = pathlib.Path(__file__).resolve().parent
-        py_files = [root / "witness_sandbox.py", root / "test_witness_sandbox.py"]
+        py_files = [
+            root / "witness_sandbox.py",
+            root / "test_witness_sandbox.py",
+            *sorted((root / "app").glob("*.py")),
+        ]
 
         for py_path in py_files:
             source = py_path.read_text("utf-8")
             tree = ast.parse(source, filename=str(py_path))
 
-            # モジュールトップレベルの import シンボルを検査 (関数内ローカル import は対象外)
+            # モジュールトップレベル (直下およびトップレベル try ブロック内) の import シンボルを検査
             exported_all: set[str] = set()
+            top_stmts: list[ast.stmt] = []
             for node in tree.body:
+                top_stmts.append(node)
+                if isinstance(node, ast.Try):
+                    top_stmts.extend(node.body)
                 if isinstance(node, ast.Assign):
                     for target in node.targets:
                         if isinstance(target, ast.Name) and target.id == "__all__":
@@ -1679,7 +1779,7 @@ class TestCodeHygieneAndDocsSync(unittest.TestCase):
                                         exported_all.add(elt.value)
 
             imported_names: dict[str, int] = {}
-            for node in tree.body:
+            for node in top_stmts:
                 if isinstance(node, ast.Import):
                     for alias in node.names:
                         bound = alias.asname or alias.name.split(".")[0]
