@@ -21,16 +21,16 @@ import numpy as np
 import cv2
 from PIL import Image, ImageGrab
 
-from PyQt6.QtCore import Qt, QPoint, QPointF, QRectF, pyqtSignal, QObject, QTimer
+from PyQt6.QtCore import Qt, QPointF, QRectF, pyqtSignal, QObject, QTimer
 from PyQt6.QtGui import (
     QImage, QPixmap, QPainter, QPen, QBrush, QColor, QFont,
-    QPolygonF, QAction, QKeySequence, QCursor, QShortcut
+    QPolygonF, QKeySequence, QShortcut
 )
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QSpinBox, QSlider, QColorDialog, QFileDialog,
-    QStackedWidget, QToolBar, QButtonGroup, QRadioButton, QCheckBox,
-    QMessageBox, QGroupBox, QSplitter, QStatusBar, QFrame, QComboBox
+    QPushButton, QLabel, QSlider, QColorDialog, QFileDialog,
+    QStackedWidget, QButtonGroup, QRadioButton, QCheckBox,
+    QMessageBox, QStatusBar, QFrame, QComboBox
 )
 
 import ctypes
@@ -491,10 +491,61 @@ class HotkeySignaler(QObject):
 
 
 # ==============================================================================
+# キャンバス共通基底クラス (ImageCanvasBase)
+# ==============================================================================
+
+class ImageCanvasBase(QWidget):
+    """
+    画像をアスペクト比維持でウィジェット中央に表示し、
+    元画像座標系とウィジェット表示座標系の相互変換を提供する共通基底クラス。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.image_bgr: np.ndarray | None = None
+        self.pixmap: QPixmap = QPixmap()
+
+    def get_display_scale_and_offset(self) -> tuple[float, float, float]:
+        """ウィジェットサイズに応じた画像のスケーリング倍率と描画オフセットを計算する。"""
+        if self.pixmap.isNull() or self.pixmap.width() <= 0 or self.pixmap.height() <= 0:
+            return 1.0, 0.0, 0.0
+        w_ratio = self.width() / self.pixmap.width()
+        h_ratio = self.height() / self.pixmap.height()
+        scale = min(w_ratio, h_ratio)
+        if scale <= 0:
+            return 1.0, 0.0, 0.0
+        offset_x = (self.width() - self.pixmap.width() * scale) / 2.0
+        offset_y = (self.height() - self.pixmap.height() * scale) / 2.0
+        return scale, offset_x, offset_y
+
+    def widget_to_image_coords(self, pt: QPointF) -> QPointF:
+        """ウィジェット上の表示座標を元画像内の座標に変換する。"""
+        scale, ox, oy = self.get_display_scale_and_offset()
+        if scale <= 0:
+            return QPointF(pt)
+        return QPointF((pt.x() - ox) / scale, (pt.y() - oy) / scale)
+
+    def image_to_widget_coords(self, pt: QPointF) -> QPointF:
+        """元画像内の座標をウィジェット上の表示座標に変換する。"""
+        scale, ox, oy = self.get_display_scale_and_offset()
+        return QPointF(pt.x() * scale + ox, pt.y() * scale + oy)
+
+    def _draw_background_or_placeholder(self, painter: QPainter, empty_message: str) -> bool:
+        """背景を塗りつぶし、画像未設定時は案内メッセージを描画して False を返す。"""
+        painter.fillRect(self.rect(), QColor(25, 25, 28))
+        if self.pixmap.isNull():
+            painter.setPen(QColor(160, 160, 160))
+            painter.setFont(QFont("Arial", 14))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, empty_message)
+            return False
+        return True
+
+
+# ==============================================================================
 # モード1: 四隅指定キャンバス (PerspectiveCanvas)
 # ==============================================================================
 
-class PerspectiveCanvas(QWidget):
+class PerspectiveCanvas(ImageCanvasBase):
     """
     キャプチャ画像上でパズル盤面の四隅をマウスクリックで指定するキャンバス。
     """
@@ -502,8 +553,6 @@ class PerspectiveCanvas(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.image_bgr: np.ndarray | None = None
-        self.pixmap: QPixmap = QPixmap()
         self.points: list[QPointF] = []  # 元画像座標系での4点
         self.hovered_point_idx: int = -1
         self.dragged_point_idx: int = -1
@@ -528,44 +577,14 @@ class PerspectiveCanvas(QWidget):
         self.points_updated.emit(self.points)
         self.update()
 
-    def get_display_scale_and_offset(self):
-        """ウィジェットサイズに応じた画像のスケーリング倍率と描画オフセットを計算する。"""
-        if self.pixmap.isNull():
-            return 1.0, 0, 0
-        w_ratio = self.width() / self.pixmap.width()
-        h_ratio = self.height() / self.pixmap.height()
-        scale = min(w_ratio, h_ratio)
-        offset_x = (self.width() - self.pixmap.width() * scale) / 2
-        offset_y = (self.height() - self.pixmap.height() * scale) / 2
-        return scale, offset_x, offset_y
-
-    def widget_to_image_coords(self, pt: QPointF) -> QPointF:
-        """ウィジェット上のマウス座標を画像内の元座標に変換する。"""
-        scale, ox, oy = self.get_display_scale_and_offset()
-        img_x = (pt.x() - ox) / scale
-        img_y = (pt.y() - oy) / scale
-        return QPointF(img_x, img_y)
-
-    def image_to_widget_coords(self, pt: QPointF) -> QPointF:
-        """画像内の元座標をウィジェット上の表示座標に変換する。"""
-        scale, ox, oy = self.get_display_scale_and_offset()
-        return QPointF(pt.x() * scale + ox, pt.y() * scale + oy)
-
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        # 背景の黒塗り
-        painter.fillRect(self.rect(), QColor(25, 25, 28))
-
-        if self.pixmap.isNull():
-            painter.setPen(QColor(160, 160, 160))
-            painter.setFont(QFont("Arial", 14))
-            painter.drawText(
-                self.rect(),
-                Qt.AlignmentFlag.AlignCenter,
-                "画像がありません。\n[画面キャプチャ(F4)] または [サンプル画像読み込み] をクリックしてください。"
-            )
+        if not self._draw_background_or_placeholder(
+            painter,
+            "画像がありません。\n[画面キャプチャ(F4)] または [サンプル画像読み込み] をクリックしてください。",
+        ):
             return
 
         scale, ox, oy = self.get_display_scale_and_offset()
@@ -677,7 +696,7 @@ class DrawMode:
     GRID_ADJUST = 4  # グリッド外枠の位置・サイズ調整
 
 
-class SandboxCanvas(QWidget):
+class SandboxCanvas(ImageCanvasBase):
     """
     パース補正後の画像上に仮想グリッドを重ね、スナップ描画や塗りつぶしを行うキャンバス。
     """
@@ -686,8 +705,6 @@ class SandboxCanvas(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.image_bgr: np.ndarray | None = None
-        self.pixmap: QPixmap = QPixmap()
 
         # グリッド設定
         self.rows: int = 4
@@ -907,7 +924,7 @@ class SandboxCanvas(QWidget):
                 self.cell_fills.pop(key, None)
             else:
                 self.cell_fills[key] = prev_color
-        elif action_type in ("add_stroke", "stroke"):
+        elif action_type == "add_stroke":
             if self.freehand_strokes:
                 self.freehand_strokes.pop()
         elif action_type == "remove_stroke":
@@ -1055,28 +1072,6 @@ class SandboxCanvas(QWidget):
     # 座標変換・グリッド計算
     # --------------------------------------------------------------------------
 
-    def get_display_scale_and_offset(self):
-        if self.pixmap.isNull():
-            return 1.0, 0, 0
-        w_ratio = self.width() / self.pixmap.width()
-        h_ratio = self.height() / self.pixmap.height()
-        scale = min(w_ratio, h_ratio)
-        offset_x = (self.width() - self.pixmap.width() * scale) / 2
-        offset_y = (self.height() - self.pixmap.height() * scale) / 2
-        return scale, offset_x, offset_y
-
-    def widget_to_image_coords(self, pt: QPointF) -> QPointF:
-        """ウィジェット上の表示座標を補正後画像の元座標に変換する。"""
-        scale, ox, oy = self.get_display_scale_and_offset()
-        if scale <= 0:
-            return QPointF(pt)
-        return QPointF((pt.x() - ox) / scale, (pt.y() - oy) / scale)
-
-    def image_to_widget_coords(self, pt: QPointF) -> QPointF:
-        """補正後画像の元座標をウィジェット上の表示座標に変換する。"""
-        scale, ox, oy = self.get_display_scale_and_offset()
-        return QPointF(pt.x() * scale + ox, pt.y() * scale + oy)
-
     def get_grid_bounds(self) -> tuple[float, float, float, float]:
         """
         画像座標系におけるグリッドの (min_x, min_y, max_x, max_y) を計算する。
@@ -1097,25 +1092,7 @@ class SandboxCanvas(QWidget):
 
     def vertex_to_widget_coords(self, col: int, row: int) -> QPointF:
         """格子頂点インデックス (col, row) をウィジェット上の表示座標に変換する。"""
-        img_pt = self.vertex_to_image_coords(col, row)
-        scale, ox, oy = self.get_display_scale_and_offset()
-        return QPointF(img_pt.x() * scale + ox, img_pt.y() * scale + oy)
-
-    def find_nearest_vertex(self, widget_pos: QPointF, threshold_px: float = 28.0) -> tuple[int, int] | None:
-        """
-        指定されたウィジェット座標に最も近いグリッド頂点 (col, row) を検出する。
-        """
-        best_v = None
-        best_dist = float("inf")
-
-        for c in range(self.cols + 1):
-            for r in range(self.rows + 1):
-                wpt = self.vertex_to_widget_coords(c, r)
-                dist = math.hypot(widget_pos.x() - wpt.x(), widget_pos.y() - wpt.y())
-                if dist < best_dist and dist <= threshold_px:
-                    best_dist = dist
-                    best_v = (c, r)
-        return best_v
+        return self.image_to_widget_coords(self.vertex_to_image_coords(col, row))
 
     # --------------------------------------------------------------------------
     # グリッド外枠の調整 (枠調整ツール)
@@ -1219,9 +1196,8 @@ class SandboxCanvas(QWidget):
         """
         指定されたウィジェット座標が位置するマス目 (col, row) を検出する。
         """
-        scale, ox, oy = self.get_display_scale_and_offset()
-        img_x = (widget_pos.x() - ox) / scale
-        img_y = (widget_pos.y() - oy) / scale
+        img_pt = self.widget_to_image_coords(widget_pos)
+        img_x, img_y = img_pt.x(), img_pt.y()
 
         min_x, min_y, max_x, max_y = self.get_grid_bounds()
         if not (min_x <= img_x <= max_x and min_y <= img_y <= max_y):
@@ -1371,16 +1347,11 @@ class SandboxCanvas(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.fillRect(self.rect(), QColor(25, 25, 28))
 
-        if self.pixmap.isNull():
-            painter.setPen(QColor(160, 160, 160))
-            painter.setFont(QFont("Arial", 14))
-            painter.drawText(
-                self.rect(),
-                Qt.AlignmentFlag.AlignCenter,
-                "補正後画像がありません。\nまずは四隅を指定して「補正してサンドボックスへ」を実行してください。"
-            )
+        if not self._draw_background_or_placeholder(
+            painter,
+            "補正後画像がありません。\nまずは四隅を指定して「補正してサンドボックスへ」を実行してください。",
+        ):
             return
 
         scale, ox, oy = self.get_display_scale_and_offset()
@@ -1481,163 +1452,211 @@ class SandboxCanvas(QWidget):
                 self.begin_undo_transaction()
                 self.erase_at_pos(pos)
 
+    def _grid_neighbors(self, vertex: tuple[int, int]) -> list[tuple[int, int]]:
+        """指定した格子頂点の上下左右の有効な隣接頂点リストを返す。"""
+        tc, tr = vertex
+        neighbors: list[tuple[int, int]] = []
+        if tc + 1 <= self.cols:
+            neighbors.append((tc + 1, tr))
+        if tc - 1 >= 0:
+            neighbors.append((tc - 1, tr))
+        if tr + 1 <= self.rows:
+            neighbors.append((tc, tr + 1))
+        if tr - 1 >= 0:
+            neighbors.append((tc, tr - 1))
+        return neighbors
+
+    def _try_rewind_snap_edge(self, sub_pos: QPointF, threshold: float) -> bool:
+        """線塗りドラッグ中に1つ前の頂点 (drag_base) へ戻った場合、直前の辺を元の状態へ巻き戻す。"""
+        if len(self.op_edges) <= 1 or self.drag_base is None:
+            return False
+        base_pt = self.vertex_to_widget_coords(*self.drag_base)
+        if math.hypot(sub_pos.x() - base_pt.x(), sub_pos.y() - base_pt.y()) > threshold:
+            return False
+
+        last_edge = self.op_edges.pop()
+        orig_color = (
+            self._tx_start_state["edges"].get(last_edge)
+            if self._tx_start_state is not None
+            else None
+        )
+        if orig_color is None:
+            self.edges.pop(last_edge, None)
+        else:
+            self.edges[last_edge] = QColor(orig_color)
+        self.update()
+
+        for v in last_edge:
+            if v in self.op_vertex_edges and last_edge in self.op_vertex_edges[v]:
+                self.op_vertex_edges[v].remove(last_edge)
+
+        self.drag_tip = self.drag_base
+        if len(self.op_edges) > 1:
+            prev_e = self.op_edges[-1]
+            self.drag_base = prev_e[0] if prev_e[1] == self.drag_tip else prev_e[1]
+        else:
+            self.drag_base = None
+            self.drag_tip = None
+        return True
+
+    def _find_best_extension_neighbor(
+        self,
+        tip: tuple[int, int],
+        exclude_vertex: tuple[int, int] | None,
+        sub_pos: QPointF,
+        threshold: float,
+    ) -> tuple[float, tuple[int, int] | None]:
+        """先端頂点 tip からマウス位置 sub_pos に向かって伸ばせる最短距離の隣接頂点を探索する。"""
+        p_tip = self.vertex_to_widget_coords(*tip)
+        dist_to_tip = math.hypot(sub_pos.x() - p_tip.x(), sub_pos.y() - p_tip.y())
+        best_next: tuple[int, int] | None = None
+        best_dist = float("inf")
+
+        for nxt in self._grid_neighbors(tip):
+            if nxt == exclude_vertex:
+                continue
+            p_nxt = self.vertex_to_widget_coords(*nxt)
+            d = point_to_segment_distance(
+                sub_pos.x(), sub_pos.y(), p_tip.x(), p_tip.y(), p_nxt.x(), p_nxt.y()
+            )
+            dist_to_nxt = math.hypot(sub_pos.x() - p_nxt.x(), sub_pos.y() - p_nxt.y())
+            if d <= threshold and d < best_dist and dist_to_nxt < dist_to_tip + 20:
+                best_dist = d
+                best_next = nxt
+
+        return best_dist, best_next
+
+    def _append_snap_extension(
+        self, base_vertex: tuple[int, int], next_vertex: tuple[int, int]
+    ) -> None:
+        """新しい辺を塗って現在のドラッグ操作の経路 (op_edges) と先端追跡状態を更新する。"""
+        new_edge = self.make_edge_key(base_vertex, next_vertex)
+        if new_edge not in self.op_edges:
+            self.apply_edge(new_edge, "paint")
+            self.op_edges.append(new_edge)
+            self.op_vertex_edges.setdefault(base_vertex, []).append(new_edge)
+            self.op_vertex_edges.setdefault(next_vertex, []).append(new_edge)
+            self.drag_base = base_vertex
+            self.drag_tip = next_vertex
+
+    def _step_snap_paint(self, sub_pos: QPointF, threshold: float) -> None:
+        """線塗りドラッグの補間1ステップ分の巻き戻しまたは延長処理を実行する。"""
+        if self._try_rewind_snap_edge(sub_pos, threshold):
+            return
+
+        if len(self.op_edges) == 1:
+            # 最初の1辺のみ: 両端点のどちらからでも伸ばし開始可能
+            init_e = self.op_edges[0]
+            best_match: tuple[tuple[int, int], tuple[int, int]] | None = None
+            best_dist = float("inf")
+            for cand_tip, cand_base in ((init_e[0], init_e[1]), (init_e[1], init_e[0])):
+                d, nxt = self._find_best_extension_neighbor(
+                    cand_tip, cand_base, sub_pos, threshold
+                )
+                if nxt is not None and d < best_dist:
+                    best_dist = d
+                    best_match = (cand_tip, nxt)
+            if best_match is not None:
+                self._append_snap_extension(*best_match)
+
+        elif len(self.op_edges) > 1 and self.drag_tip is not None:
+            # 2本目以降: 現在の先端からのみ次の方向へ伸ばす (1操作での分岐を抑止)
+            if len(self.op_vertex_edges.get(self.drag_tip, [])) < 2:
+                _, best_next = self._find_best_extension_neighbor(
+                    self.drag_tip, self.drag_base, sub_pos, threshold
+                )
+                if best_next is not None:
+                    self._append_snap_extension(self.drag_tip, best_next)
+
+    def _handle_move_grid_adjust(
+        self, pos: QPointF, buttons: Qt.MouseButton
+    ) -> None:
+        """枠調整モードのマウス移動（ドラッグ変形またはカーソル形状更新）を処理する。"""
+        if self.adjust_flags is not None and (buttons & Qt.MouseButton.LeftButton):
+            self.apply_grid_adjust(pos)
+        else:
+            self.setCursor(self.adjust_cursor_for(self.find_adjust_target(pos)))
+
+    def _update_hovered_edge(self, pos: QPointF) -> None:
+        """カーソル近傍のホバー辺を更新して再描画を要求する。"""
+        edge = self.find_nearest_edge(pos)
+        if edge != self.hovered_edge:
+            self.hovered_edge = edge
+            self.update()
+
+    def _handle_move_snap_line(
+        self, pos: QPointF, buttons: Qt.MouseButton
+    ) -> None:
+        """線塗りモードのマウスドラッグ（連続塗り・巻き戻し・連続消去）を処理する。"""
+        if not (self.edge_drag_mode and (buttons & Qt.MouseButton.LeftButton)):
+            return
+
+        start = self.last_drag_pos if self.last_drag_pos is not None else pos
+        dist = math.hypot(pos.x() - start.x(), pos.y() - start.y())
+        steps = max(1, int(dist // 8))
+        threshold = self.edge_hit_threshold()
+
+        for step_idx in range(1, steps + 1):
+            t = step_idx / steps
+            sub_pos = QPointF(
+                start.x() + (pos.x() - start.x()) * t,
+                start.y() + (pos.y() - start.y()) * t,
+            )
+            if self.edge_drag_mode == "paint":
+                self._step_snap_paint(sub_pos, threshold)
+            elif self.edge_drag_mode == "erase":
+                edge = self.find_nearest_edge(sub_pos)
+                if edge is not None:
+                    self.apply_edge(edge, "erase")
+
+        self.last_drag_pos = pos
+
+    def _handle_move_freehand(self, pos: QPointF) -> None:
+        """自由手書きモードのドラッグ点追加を処理する。"""
+        if self.active_stroke:
+            self.active_stroke.append(self.widget_to_image_coords(pos))
+            self.update()
+
+    def _handle_move_cell_fill(
+        self, pos: QPointF, buttons: Qt.MouseButton
+    ) -> None:
+        """マス目塗りモードのドラッグ連続塗りを処理する。"""
+        if buttons & Qt.MouseButton.LeftButton:
+            if self._tx_start_state is None:
+                self.begin_undo_transaction()
+            cell = self.find_cell_at_pos(pos)
+            if cell is not None and self.cell_fills.get(cell) != self.current_color:
+                self.cell_fills[cell] = QColor(self.current_color)
+                self.update()
+
+    def _handle_move_eraser(
+        self, pos: QPointF, buttons: Qt.MouseButton
+    ) -> None:
+        """消しゴムモードのドラッグ連続消去を処理する。"""
+        if buttons & Qt.MouseButton.LeftButton:
+            if self._tx_start_state is None:
+                self.begin_undo_transaction()
+            self.erase_at_pos(pos)
+
     def mouseMoveEvent(self, event):
         pos = event.position()
+        buttons = event.buttons()
 
         if self.draw_mode == DrawMode.GRID_ADJUST:
-            if self.adjust_flags is not None and (event.buttons() & Qt.MouseButton.LeftButton):
-                self.apply_grid_adjust(pos)
-            else:
-                self.setCursor(self.adjust_cursor_for(self.find_adjust_target(pos)))
+            self._handle_move_grid_adjust(pos, buttons)
             return
 
         if self.draw_mode in (DrawMode.SNAP_LINE, DrawMode.ERASER):
-            # ホバー辺の更新
-            edge = self.find_nearest_edge(pos)
-            if edge != self.hovered_edge:
-                self.hovered_edge = edge
-                self.update()
+            self._update_hovered_edge(pos)
 
         if self.draw_mode == DrawMode.SNAP_LINE:
-            if self.edge_drag_mode and (event.buttons() & Qt.MouseButton.LeftButton):
-                start = self.last_drag_pos if self.last_drag_pos is not None else pos
-                dist = math.hypot(pos.x() - start.x(), pos.y() - start.y())
-                steps = max(1, int(dist // 8))
-
-                def get_neighbors(v):
-                    tc, tr = v
-                    res = []
-                    if tc + 1 <= self.cols: res.append((tc + 1, tr))
-                    if tc - 1 >= 0: res.append((tc - 1, tr))
-                    if tr + 1 <= self.rows: res.append((tc, tr + 1))
-                    if tr - 1 >= 0: res.append((tc, tr - 1))
-                    return res
-
-                threshold = self.edge_hit_threshold()
-
-                for step_idx in range(1, steps + 1):
-                    t = step_idx / steps
-                    sub_pos = QPointF(start.x() + (pos.x() - start.x()) * t, start.y() + (pos.y() - start.y()) * t)
-
-                    if self.edge_drag_mode == "paint":
-                        # 1. 巻き戻し判定: マウスが1つ前の頂点 (drag_base) に戻った場合
-                        if len(self.op_edges) > 1 and self.drag_base is not None:
-                            base_pt = self.vertex_to_widget_coords(*self.drag_base)
-                            if math.hypot(sub_pos.x() - base_pt.x(), sub_pos.y() - base_pt.y()) <= threshold:
-                                last_edge = self.op_edges.pop()
-                                # ドラッグ開始前の元の辺状態（未塗りなら削除、既存色があればその色）へ復元
-                                orig_color = (
-                                    self._tx_start_state["edges"].get(last_edge)
-                                    if self._tx_start_state is not None
-                                    else None
-                                )
-                                if orig_color is None:
-                                    self.edges.pop(last_edge, None)
-                                else:
-                                    self.edges[last_edge] = QColor(orig_color)
-                                self.update()
-                                for v in last_edge:
-                                    if v in self.op_vertex_edges and last_edge in self.op_vertex_edges[v]:
-                                        self.op_vertex_edges[v].remove(last_edge)
-                                self.drag_tip = self.drag_base
-                                if len(self.op_edges) > 1:
-                                    prev_e = self.op_edges[-1]
-                                    self.drag_base = prev_e[0] if prev_e[1] == self.drag_tip else prev_e[1]
-                                else:
-                                    self.drag_base = None
-                                    self.drag_tip = None
-                                continue
-
-                        # 2. 次の辺へ伸ばす判定 (1つの交点からは1操作で1方向にしか伸ばせない)
-                        if len(self.op_edges) == 1:
-                            # 最初の1辺のみ: 両端点のどちらからでも伸ばし開始可能
-                            init_e = self.op_edges[0]
-                            cand_pairs = [(init_e[0], init_e[1]), (init_e[1], init_e[0])]
-                            best_match = None
-                            best_dist = float("inf")
-
-                            for cand_tip, cand_base in cand_pairs:
-                                p_tip = self.vertex_to_widget_coords(*cand_tip)
-                                dist_to_tip = math.hypot(sub_pos.x() - p_tip.x(), sub_pos.y() - p_tip.y())
-                                for nxt in get_neighbors(cand_tip):
-                                    if nxt == cand_base:
-                                        continue
-                                    p_nxt = self.vertex_to_widget_coords(*nxt)
-                                    d = point_to_segment_distance(sub_pos.x(), sub_pos.y(), p_tip.x(), p_tip.y(), p_nxt.x(), p_nxt.y())
-                                    dist_to_nxt = math.hypot(sub_pos.x() - p_nxt.x(), sub_pos.y() - p_nxt.y())
-                                    if d <= threshold and d < best_dist and dist_to_nxt < dist_to_tip + 20:
-                                        best_dist = d
-                                        best_match = (cand_tip, nxt)
-
-                            if best_match is not None:
-                                c_tip, nxt = best_match
-                                new_edge = self.make_edge_key(c_tip, nxt)
-                                if new_edge not in self.op_edges:
-                                    self.apply_edge(new_edge, "paint")
-                                    self.op_edges.append(new_edge)
-                                    self.op_vertex_edges.setdefault(c_tip, []).append(new_edge)
-                                    self.op_vertex_edges.setdefault(nxt, []).append(new_edge)
-                                    self.drag_base = c_tip
-                                    self.drag_tip = nxt
-
-                        elif len(self.op_edges) > 1 and self.drag_tip is not None:
-                            # 2本目以降: 現在の先端からのみ次の方向へ伸ばす (先端からの次数を1に制限)
-                            tip_edges_in_op = self.op_vertex_edges.get(self.drag_tip, [])
-                            if len(tip_edges_in_op) < 2:
-                                best_next = None
-                                best_dist = float("inf")
-                                p_tip = self.vertex_to_widget_coords(*self.drag_tip)
-                                dist_to_tip = math.hypot(sub_pos.x() - p_tip.x(), sub_pos.y() - p_tip.y())
-
-                                for nxt in get_neighbors(self.drag_tip):
-                                    if nxt == self.drag_base:
-                                        continue
-                                    p_nxt = self.vertex_to_widget_coords(*nxt)
-                                    d = point_to_segment_distance(sub_pos.x(), sub_pos.y(), p_tip.x(), p_tip.y(), p_nxt.x(), p_nxt.y())
-                                    dist_to_nxt = math.hypot(sub_pos.x() - p_nxt.x(), sub_pos.y() - p_nxt.y())
-
-                                    if d <= threshold and d < best_dist and dist_to_nxt < dist_to_tip + 20:
-                                        best_dist = d
-                                        best_next = nxt
-
-                                if best_next is not None:
-                                    new_edge = self.make_edge_key(self.drag_tip, best_next)
-                                    if new_edge not in self.op_edges:
-                                        self.apply_edge(new_edge, "paint")
-                                        self.op_edges.append(new_edge)
-                                        self.op_vertex_edges.setdefault(self.drag_tip, []).append(new_edge)
-                                        self.op_vertex_edges.setdefault(best_next, []).append(new_edge)
-                                        self.drag_base = self.drag_tip
-                                        self.drag_tip = best_next
-
-                    elif self.edge_drag_mode == "erase":
-                        edge = self.find_nearest_edge(sub_pos)
-                        if edge is not None:
-                            self.apply_edge(edge, "erase")
-
-                self.last_drag_pos = pos
-
+            self._handle_move_snap_line(pos, buttons)
         elif self.draw_mode == DrawMode.FREEHAND:
-            if self.active_stroke:
-                self.active_stroke.append(self.widget_to_image_coords(pos))
-                self.update()
-
+            self._handle_move_freehand(pos)
         elif self.draw_mode == DrawMode.CELL_FILL:
-            # ドラッグで連続塗りつぶし (左ボタン押下時)
-            if event.buttons() & Qt.MouseButton.LeftButton:
-                if self._tx_start_state is None:
-                    self.begin_undo_transaction()
-                cell = self.find_cell_at_pos(pos)
-                if cell is not None and self.cell_fills.get(cell) != self.current_color:
-                    self.cell_fills[cell] = QColor(self.current_color)
-                    self.update()
-
+            self._handle_move_cell_fill(pos, buttons)
         elif self.draw_mode == DrawMode.ERASER:
-            # 消しゴムのドラッグなぞり消去
-            if event.buttons() & Qt.MouseButton.LeftButton:
-                if self._tx_start_state is None:
-                    self.begin_undo_transaction()
-                self.erase_at_pos(pos)
+            self._handle_move_eraser(pos, buttons)
 
     def mouseReleaseEvent(self, event):
         if self.draw_mode == DrawMode.FREEHAND:
@@ -2146,11 +2165,7 @@ class MainWindow(QMainWindow):
             bgr = capture_foreground_window_bgr(
                 target_hwnd or None, exclude_hwnd=own_hwnd or None
             )
-
-            self.captured_bgr = bgr
-            self.perspective_canvas.set_image(bgr)
-            self.switch_mode(0)
-            self.btn_goto_sandbox.setEnabled(False)
+            self._load_captured_image_to_perspective(bgr)
         except Exception as e:
             QMessageBox.critical(self, "キャプチャエラー", f"画面キャプチャに失敗しました:\n{e}")
         finally:
@@ -2163,6 +2178,19 @@ class MainWindow(QMainWindow):
                     and int(self.winId()) != self._registered_hotkey_hwnd
                 ):
                     self._register_global_hotkey()
+
+    def _load_captured_image_to_perspective(
+        self, img_bgr: np.ndarray, preset_points: list[QPointF] | None = None
+    ):
+        """読み込んだ画像を四隅指定キャンバスへセットしてモードを初期化する。"""
+        self.captured_bgr = img_bgr
+        self.perspective_canvas.set_image(img_bgr)
+        if preset_points:
+            self.perspective_canvas.points = list(preset_points)
+            self.perspective_canvas.points_updated.emit(self.perspective_canvas.points)
+            self.perspective_canvas.update()
+        self.switch_mode(0)
+        self.btn_goto_sandbox.setEnabled(False)
 
     def action_open_file(self):
         """ローカル画像ファイルを開く。"""
@@ -2178,27 +2206,37 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "画像読込エラー", f"画像の読み込みに失敗しました:\n{e}")
             return
 
-        self.captured_bgr = img_bgr
-        self.perspective_canvas.set_image(img_bgr)
-        self.switch_mode(0)
-        self.btn_goto_sandbox.setEnabled(False)
+        self._load_captured_image_to_perspective(img_bgr)
 
     def action_load_sample(self):
         """The Witness風の斜めパズルサンプル画像を生成してロードする。"""
         sample_bgr = create_sample_witness_image()
-        self.captured_bgr = sample_bgr
-        self.perspective_canvas.set_image(sample_bgr)
         # サンプル用の斜め四隅をプリセット (すぐに補正を体験可能)
-        self.perspective_canvas.points = [
+        preset_points = [
             QPointF(220, 110),
             QPointF(780, 70),
             QPointF(890, 580),
-            QPointF(150, 610)
+            QPointF(150, 610),
         ]
-        self.perspective_canvas.points_updated.emit(self.perspective_canvas.points)
-        self.perspective_canvas.update()
-        self.switch_mode(0)
-        self.btn_goto_sandbox.setEnabled(False)
+        self._load_captured_image_to_perspective(sample_bgr, preset_points=preset_points)
+
+    def _apply_detected_grid_settings(self, cols: int, rows: int, margin: float):
+        """自動検知された列数・行数・マージン割合をUIスライダーとキャンバスへ一括反映する。"""
+        if cols > 8 or rows > 8 or cols < 3 or rows < 3:
+            self.chk_unlock_size.setChecked(True)
+        self.slider_cols.blockSignals(True)
+        self.slider_rows.blockSignals(True)
+        self.slider_cols.setValue(cols)
+        self.slider_rows.setValue(rows)
+        self.slider_cols.blockSignals(False)
+        self.slider_rows.blockSignals(False)
+        self.lbl_cols_val.setText(str(cols))
+        self.lbl_rows_val.setText(str(rows))
+        self.slider_margin.blockSignals(True)
+        self.slider_margin.setValue(int(round(margin * 100)))
+        self.slider_margin.blockSignals(False)
+        self.sandbox_canvas.set_grid_dimensions(rows, cols)
+        self.sandbox_canvas.set_margin_percent(margin)
 
     def action_detect_grid(self):
         """
@@ -2222,21 +2260,7 @@ class MainWindow(QMainWindow):
             return
 
         cols, rows, margin = detect_grid_dimensions(img_to_analyze, pts)
-        if cols > 8 or rows > 8 or cols < 3 or rows < 3:
-            self.chk_unlock_size.setChecked(True)
-        self.slider_cols.blockSignals(True)
-        self.slider_rows.blockSignals(True)
-        self.slider_cols.setValue(cols)
-        self.slider_rows.setValue(rows)
-        self.slider_cols.blockSignals(False)
-        self.slider_rows.blockSignals(False)
-        self.lbl_cols_val.setText(str(cols))
-        self.lbl_rows_val.setText(str(rows))
-        self.slider_margin.blockSignals(True)
-        self.slider_margin.setValue(int(round(margin * 100)))
-        self.slider_margin.blockSignals(False)
-        self.sandbox_canvas.set_grid_dimensions(rows, cols)
-        self.sandbox_canvas.set_margin_percent(margin)
+        self._apply_detected_grid_settings(cols, rows, margin)
 
         msg = f"✅ マス目を自動検知しました: {cols}列 × {rows}行 (マージン: {int(round(margin * 100))}%)"
         self.status_bar.showMessage(msg, 6000)
@@ -2261,19 +2285,6 @@ class MainWindow(QMainWindow):
             validate_quad_points(pts)
             # 補正前に自動でグリッド線（マス目数）を自動検知
             detected_cols, detected_rows, detected_margin = detect_grid_dimensions(self.captured_bgr, pts)
-            if detected_cols > 8 or detected_rows > 8 or detected_cols < 3 or detected_rows < 3:
-                self.chk_unlock_size.setChecked(True)
-            self.slider_cols.blockSignals(True)
-            self.slider_rows.blockSignals(True)
-            self.slider_cols.setValue(detected_cols)
-            self.slider_rows.setValue(detected_rows)
-            self.slider_cols.blockSignals(False)
-            self.slider_rows.blockSignals(False)
-            self.lbl_cols_val.setText(str(detected_cols))
-            self.lbl_rows_val.setText(str(detected_rows))
-            self.slider_margin.blockSignals(True)
-            self.slider_margin.setValue(int(round(detected_margin * 100)))
-            self.slider_margin.blockSignals(False)
 
             aspect_mode = self.combo_aspect.currentData() or "square"
             warped = warp_perspective(
@@ -2285,8 +2296,9 @@ class MainWindow(QMainWindow):
             )
             self.warped_bgr = warped
             self.sandbox_canvas.set_warped_image(warped)
-            self.sandbox_canvas.set_grid_dimensions(detected_rows, detected_cols)
-            self.sandbox_canvas.set_margin_percent(detected_margin)
+            self._apply_detected_grid_settings(
+                detected_cols, detected_rows, detected_margin
+            )
 
             # サンドボックスモードへ切り替え
             self.btn_goto_sandbox.setEnabled(True)
@@ -2326,16 +2338,6 @@ class MainWindow(QMainWindow):
         self.slider_margin.setValue(clamped)
         self.slider_margin.blockSignals(False)
 
-    @property
-    def spin_cols(self):
-        """後方互換用エイリアス"""
-        return self.slider_cols
-
-    @property
-    def spin_rows(self):
-        """後方互換用エイリアス"""
-        return self.slider_rows
-
     def _on_unlock_size_changed(self, state: int):
         """制限解除チェックボックスの変更ハンドラ"""
         if state == Qt.CheckState.Checked.value:
@@ -2359,15 +2361,6 @@ class MainWindow(QMainWindow):
         self.lbl_rows_val.setText(str(val))
         self.sandbox_canvas.set_grid_dimensions(val, self.slider_cols.value())
 
-    def _on_grid_size_changed(self):
-        """グリッドサイズ変更ハンドラ (外部・互換用)"""
-        cols = self.slider_cols.value()
-        rows = self.slider_rows.value()
-        self.lbl_cols_val.setText(str(cols))
-        self.lbl_rows_val.setText(str(rows))
-        self.sandbox_canvas.set_grid_dimensions(rows, cols)
-
-
     def action_toggle_topmost(self, checked: bool):
         """最前面表示トグル (setWindowFlags による HWND 再生成時もホットキーを維持)"""
         was_hotkey_registered = self._registered_hotkey_hwnd is not None
@@ -2385,22 +2378,22 @@ class MainWindow(QMainWindow):
         if was_hotkey_registered:
             self._register_global_hotkey()
 
+    def _apply_pen_color(self, color: QColor):
+        """選択されたペン色をキャンバスと色インジケータボタンへ反映する。"""
+        self.sandbox_canvas.set_color(color)
+        self.btn_color_indicator.setStyleSheet(
+            f"background-color: {color.name()}; border: 1px solid #ffffff; border-radius: 4px;"
+        )
+
     def action_choose_color(self):
         """カラーピッカーダイアログを表示する。"""
         col = QColorDialog.getColor(self.sandbox_canvas.current_color, self, "ペンの色を選択")
         if col.isValid():
-            self.sandbox_canvas.set_color(col)
-            self.btn_color_indicator.setStyleSheet(
-                f"background-color: {col.name()}; border: 1px solid #ffffff; border-radius: 4px;"
-            )
+            self._apply_pen_color(col)
 
     def action_set_preset_color(self, hex_color: str):
         """プリセット色を設定する。"""
-        col = QColor(hex_color)
-        self.sandbox_canvas.set_color(col)
-        self.btn_color_indicator.setStyleSheet(
-            f"background-color: {hex_color}; border: 1px solid #ffffff; border-radius: 4px;"
-        )
+        self._apply_pen_color(QColor(hex_color))
 
     def action_save_sandbox_image(self):
         """現在のサンドボックスキャンバスの内容を元解像度画像ファイルとして保存する。"""
@@ -2438,56 +2431,49 @@ class MainWindow(QMainWindow):
 # メインエントリーポイント
 # ==============================================================================
 
+DARK_STYLE_QSS = """
+    QMainWindow, QWidget {
+        background-color: #1e1e24;
+        color: #e0e0e0;
+        font-family: 'Segoe UI', Meiryo, sans-serif;
+    }
+    QPushButton {
+        background-color: #33333d;
+        color: #ffffff;
+        border: 1px solid #4f4f5c;
+        border-radius: 4px;
+        padding: 5px 10px;
+    }
+    QPushButton:hover {
+        background-color: #444452;
+        border-color: #00bcd4;
+    }
+    QPushButton:pressed {
+        background-color: #25252d;
+    }
+    QPushButton:disabled {
+        background-color: #26262c;
+        color: #666670;
+        border-color: #363640;
+    }
+    QRadioButton, QCheckBox {
+        color: #e0e0e0;
+        spacing: 5px;
+    }
+    QStatusBar {
+        background-color: #18181c;
+        color: #aaaaaa;
+    }
+    QFrame[frameShape="4"], QFrame[frameShape="5"] {
+        color: #444450;
+    }
+"""
+
+
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
-
-    # ダークテーマ調のスタイルシート設定
-    dark_style = """
-        QMainWindow, QWidget {
-            background-color: #1e1e24;
-            color: #e0e0e0;
-            font-family: 'Segoe UI', Meiryo, sans-serif;
-        }
-        QPushButton {
-            background-color: #33333d;
-            color: #ffffff;
-            border: 1px solid #4f4f5c;
-            border-radius: 4px;
-            padding: 5px 10px;
-        }
-        QPushButton:hover {
-            background-color: #444452;
-            border-color: #00bcd4;
-        }
-        QPushButton:pressed {
-            background-color: #25252d;
-        }
-        QPushButton:disabled {
-            background-color: #26262c;
-            color: #666670;
-            border-color: #363640;
-        }
-        QRadioButton, QCheckBox {
-            color: #e0e0e0;
-            spacing: 5px;
-        }
-        QSpinBox {
-            background-color: #2b2b36;
-            color: #ffffff;
-            border: 1px solid #4f4f5c;
-            border-radius: 3px;
-            padding: 2px 4px;
-        }
-        QStatusBar {
-            background-color: #18181c;
-            color: #aaaaaa;
-        }
-        QFrame[frameShape="4"], QFrame[frameShape="5"] {
-            color: #444450;
-        }
-    """
-    app.setStyleSheet(dark_style)
+    app.setStyleSheet(DARK_STYLE_QSS)
 
     window = MainWindow()
     window.center_on_screen()
