@@ -59,36 +59,45 @@
 
 ## 🛠️ インストールと実行方法
 
-本プロジェクトは Python で記述されています。依存関係の管理と実行には、高速な Python パッケージマネージャである [uv](https://github.com/astral-sh/uv) の使用を推奨します。
+本プロジェクトの実行には **Python 3.10 以上** が必要です。依存関係の管理と実行には、高速な Python パッケージマネージャである [uv](https://github.com/astral-sh/uv) の使用を推奨します。
 
 ### 1. `uv` を使用した起動（推奨）
 
-`uv` をインストール済みであれば、以下のコマンドを実行するだけで仮想環境の構築と依存ライブラリのインストール、アプリの起動がすべて自動で行われます。
+`uv` をインストール済みであれば、`pyproject.toml` の定義に基づき、以下のコマンドを実行するだけで仮想環境の構築と依存ライブラリのインストール、アプリの起動がすべて自動で行われます。
 
 ```bash
 # リポジトリのクローン
 git clone https://github.com/rock0714/witness_sandbox.git
 cd witness_sandbox
 
-# uv を使って起動
+# 依存解決とアプリの起動
 uv run witness_sandbox.py
 ```
 
-### 2. 標準の `pip` を使用した起動
+### 2. 標準の `venv` + `pip` を使用した起動
 
-標準的な Python 環境を使用する場合は、以下の手順を実行してください。
+`uv` を使用せず標準の Python 環境で実行する場合は、仮想環境を作成してから依存パッケージをインストールしてください。
 
-```bash
+```powershell
 # リポジトリのクローン
 git clone https://github.com/rock0714/witness_sandbox.git
 cd witness_sandbox
 
-# パッケージのインストール
+# 仮想環境の作成（初回のみ）
+python -m venv .venv
+
+# 仮想環境の有効化（Windows PowerShell の場合）
+.\.venv\Scripts\Activate.ps1
+# ※ コマンドプロンプト (cmd.exe) の場合は: .\.venv\Scripts\activate.bat
+
+# 依存パッケージのインストール（初回のみ）
 pip install -r requirements.txt
 
-# 起動
+# アプリの起動
 python witness_sandbox.py
 ```
+
+（同じ仮想環境が有効な状態、またはグローバル環境に依存パッケージを導入済みの場合は、`run_sandbox.bat` のダブルクリックでも起動できます。）
 
 > [!NOTE]
 > `keyboard` ライブラリによるグローバルホットキー（F4）は、他のアプリがフォーカスされていても動作します。環境によっては管理者権限が必要な場合がありますが、UI上の「📷 画面キャプチャ」ボタンでも同様にキャプチャ可能です。

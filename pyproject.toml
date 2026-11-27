@@ -1,0 +1,19 @@
+# The Witness パズル考察サンドボックス プロジェクト定義
+[project]
+name = "witness-sandbox"
+version = "0.1.0"
+description = "「The Witness」のパズル盤面を透視投影変換で正面補正し、仮想グリッド上で考察を行うサポートツール"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = [
+    "PyQt6>=6.5.0",
+    "opencv-python>=4.8.0",
+    "Pillow>=10.0.0",
+    "numpy>=1.24.0",
+    "keyboard>=0.13.5",
+]
+
+[tool.uv]
+# 単一スクリプト構成のアプリケーションのため、パッケージ自体のビルドは行わず依存解決のみ行う
+package = false
