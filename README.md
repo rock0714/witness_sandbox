@@ -134,6 +134,38 @@ python witness_sandbox.py
 
 ---
 
+## 🧪 テストの実行方法
+
+自動テスト（`test_witness_sandbox.py`）は標準ライブラリの `unittest` とオフスクリーン描画モード（`QT_QPA_PLATFORM="offscreen"`）で動作するため、追加のテスト用パッケージを導入せずにそのまま実行できます。
+
+### 全テストの一括実行
+
+```powershell
+# uv を使用する場合
+uv run python -m unittest discover -v
+
+# 標準の Python 環境（仮想環境を有効化済み）の場合
+python -m unittest discover -v
+# （スクリプトの直接実行も可能です: python test_witness_sandbox.py）
+```
+
+### クラス・項目単位での個別実行
+
+特定のテストクラスや1つのテスト項目だけを指定して、独立に実行・成否判定を行うこともできます。
+
+```powershell
+# テストクラス単位で実行する例（SandboxCanvas のテストのみ）
+python -m unittest test_witness_sandbox.TestSandboxCanvas -v
+
+# 1項目（テストメソッド）単位で実行する例（4点ソートのテストのみ）
+python -m unittest test_witness_sandbox.TestGeometryAndVision.test_order_points -v
+
+# uv 経由で1項目だけ実行する例
+uv run python -m unittest test_witness_sandbox.TestGeometryAndVision.test_order_points -v
+```
+
+---
+
 ## 📄 ライセンス
 
 このプロジェクトは [MIT ライセンス](LICENSE) の元で公開されています。自由に改変・再配布が可能です。
