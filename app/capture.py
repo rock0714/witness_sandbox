@@ -26,7 +26,11 @@ def get_foreground_window_hwnd() -> int:
     """現在の前面ウィンドウの HWND を返す。非 Windows 環境や取得失敗時は 0 を返す。"""
     try:
         if hasattr(ctypes, "windll"):
-            return int(ctypes.windll.user32.GetForegroundWindow())
+            get_fg = ctypes.windll.user32.GetForegroundWindow
+            if wintypes is not None:
+                get_fg.restype = wintypes.HWND
+            fg = get_fg()
+            return int(fg) if fg else 0
     except Exception:
         pass
     return 0
@@ -39,17 +43,18 @@ def get_window_rect(hwnd: int) -> tuple[int, int, int, int] | None:
     最小化・サイズ不正・取得失敗時は None。
     """
     try:
-        if not hasattr(ctypes, "windll") or wintypes is None:
+        if not hwnd or not hasattr(ctypes, "windll") or wintypes is None:
             return None
         user32 = ctypes.windll.user32
-        if not hwnd or not user32.IsWindow(hwnd) or user32.IsIconic(hwnd):
+        native_hwnd = wintypes.HWND(hwnd)
+        if not user32.IsWindow(native_hwnd) or user32.IsIconic(native_hwnd):
             return None
         rect = wintypes.RECT()
         # DWMWA_EXTENDED_FRAME_BOUNDS = 9 (ウィンドウ影を除いた見た目通りの枠)
         res = ctypes.windll.dwmapi.DwmGetWindowAttribute(
-            wintypes.HWND(hwnd), 9, ctypes.byref(rect), ctypes.sizeof(rect)
+            native_hwnd, 9, ctypes.byref(rect), ctypes.sizeof(rect)
         )
-        if res != 0 and not user32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(rect)):
+        if res != 0 and not user32.GetWindowRect(native_hwnd, ctypes.byref(rect)):
             return None
         l, t, r, b = rect.left, rect.top, rect.right, rect.bottom
         # 仮想デスクトップ範囲 (全モニタ) にクリップ
@@ -152,10 +157,11 @@ def is_f4_hotkey_message(event_type_bytes: bytes, message_addr: int) -> bool:
 
 def activate_window_native(hwnd: int) -> None:
     """Windows API で指定ウィンドウを通常表示・最前面フォアグラウンド化する。"""
-    if not hwnd or not hasattr(ctypes, "windll"):
+    if not hwnd or not hasattr(ctypes, "windll") or wintypes is None:
         return
     try:
-        ctypes.windll.user32.ShowWindow(hwnd, 1)  # 1 = SW_SHOWNORMAL
-        ctypes.windll.user32.SetForegroundWindow(hwnd)
+        native_hwnd = wintypes.HWND(hwnd)
+        ctypes.windll.user32.ShowWindow(native_hwnd, 1)  # 1 = SW_SHOWNORMAL
+        ctypes.windll.user32.SetForegroundWindow(native_hwnd)
     except Exception as e:
         print(f"[Warn] フォアグラウンド設定警告: {e}", flush=True)

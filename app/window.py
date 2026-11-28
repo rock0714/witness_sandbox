@@ -428,7 +428,10 @@ class MainWindow(QMainWindow):
                 return True, 0
         except Exception:
             pass
-        return super().nativeEvent(eventType, message)
+        # PyQt6 (Windows) では super().nativeEvent が (False, None) を返し、
+        # 第2要素に None をそのまま C++ 側へ返すと SIP ラッパーで Access Violation が起きるため 0 に正規化する
+        handled, result = super().nativeEvent(eventType, message)
+        return bool(handled), (0 if result is None else result)
 
     def closeEvent(self, event):
         """アプリ終了処理"""
