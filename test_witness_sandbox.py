@@ -1613,14 +1613,21 @@ class TestMainWindowAndCapture(unittest.TestCase):
                 self.assertFalse(self.window._hotkey_init_timer.isActive())
                 self.assertFalse(self.window._register_global_hotkey())
 
-                # activate_window_native: hwnd=0 は no-op、有効 hwnd は ShowWindow/SetForegroundWindow を呼び例外も吸収
+                # activate_window_native: hwnd=0 は no-op、64-bit hwnd も HWND 型で ShowWindow/SetForegroundWindow を呼び例外も吸収
                 capture.activate_window_native(0)
                 fake_user32.ShowWindow.assert_not_called()
-                capture.activate_window_native(4321)
-                fake_user32.ShowWindow.assert_called_once_with(4321, 1)
-                fake_user32.SetForegroundWindow.assert_called_once_with(4321)
+                hwnd_64bit = 0x0000000180004321
+                capture.activate_window_native(hwnd_64bit)
+                self.assertEqual(fake_user32.ShowWindow.call_count, 1)
+                show_args = fake_user32.ShowWindow.call_args[0]
+                if capture.wintypes is not None:
+                    self.assertIsInstance(show_args[0], capture.wintypes.HWND)
+                self.assertEqual(getattr(show_args[0], "value", show_args[0]), hwnd_64bit)
+                self.assertEqual(show_args[1], 1)
+                fg_args = fake_user32.SetForegroundWindow.call_args[0]
+                self.assertEqual(getattr(fg_args[0], "value", fg_args[0]), hwnd_64bit)
                 fake_user32.SetForegroundWindow.side_effect = RuntimeError("denied")
-                capture.activate_window_native(4321)  # 例外が外部へ漏れないこと
+                capture.activate_window_native(hwnd_64bit)  # 例外が外部へ漏れないこと
 
             # 非 Windows 環境での activate_window_native も安全に no-op となること
             with mock.patch.object(capture, "ctypes", new=mock.MagicMock(spec=[])):
@@ -1634,16 +1641,21 @@ class TestMainWindowAndCapture(unittest.TestCase):
                     lambda: triggered.append(True)
                 )
 
-                # 対象外のホットキー ID は無視されて基底へ委譲される
+                # 対象外のホットキー ID は無視されて基底へ委譲され、第2戻り値も None ではなく整数 0 に正規化される
                 other_msg = capture.wintypes.MSG()
                 other_msg.message = capture.WM_HOTKEY
                 other_msg.wParam = 9999
-                handled, _ = self.window.nativeEvent(
+                handled, unhandled_res = self.window.nativeEvent(
                     QByteArray(b"windows_generic_MSG"),
                     sip.voidptr(capture.ctypes.addressof(other_msg)),
                 )
                 QApplication.processEvents()
                 self.assertFalse(handled)
+                self.assertIsNotNone(
+                    unhandled_res,
+                    "nativeEvent の第2戻り値が None のままだと実 Windows 環境の SIP ラッパーでクラッシュします",
+                )
+                self.assertEqual(unhandled_res, 0)
                 self.assertEqual(len(triggered), 0)
 
                 # HOTKEY_ID_F4 の WM_HOTKEY で (True, 0) を返し capture_requested が発火する
@@ -1660,6 +1672,45 @@ class TestMainWindowAndCapture(unittest.TestCase):
                 self.assertEqual(len(triggered), 1, "WM_HOTKEY でキャプチャ要求が発火していません")
         finally:
             self._hotkey_patcher.start()
+
+    def test_real_platform_entrypoint_startup_does_not_crash(self):
+        """実プラットフォームプラグイン (Windows WndProc / nativeEvent 経路) で witness_sandbox.py がクラッシュせず起動・終了すること。"""
+        import pathlib
+        import subprocess
+
+        root = pathlib.Path(__file__).resolve().parent
+        env = dict(os.environ)
+        env["PYTHONIOENCODING"] = "utf-8"
+        if sys.platform == "win32":
+            # Windows では offscreen を解除し、本物の qwindows (WndProc -> nativeEvent -> SIP) 経路を検証する
+            env.pop("QT_QPA_PLATFORM", None)
+        else:
+            env.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+        smoke_code = (
+            "import runpy; "
+            "from PyQt6.QtCore import QTimer; "
+            "from PyQt6.QtWidgets import QApplication; "
+            "orig_exec = QApplication.exec; "
+            "QApplication.exec = staticmethod(lambda: (QTimer.singleShot(80, QApplication.quit), orig_exec())[1]); "
+            "runpy.run_path('witness_sandbox.py', run_name='__main__')"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-X", "faulthandler", "-c", smoke_code],
+            cwd=str(root),
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            check=False,
+        )
+        self.assertEqual(
+            proc.returncode,
+            0,
+            f"実プラットフォームでの起動時にクラッシュしました (code={proc.returncode}):\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
+        )
 
 
 # ==============================================================================
